@@ -1,0 +1,24 @@
+Transcript: "I Built a Self-Improving AI Second Brain"
+Source: https://www.youtube.com/shorts/f_iWrXDpUkw
+Channel: Systems Made Better
+Duration: ~57 seconds
+Published: 2026-06-10
+
+--------------------------------------------------------------------------------
+
+I just built a self-improving second brain with Claude and it's very convincing. One of the most respected people in AI quietly posted how he runs his personal knowledge base. 105,000 people bookmarked it and probably very few have actually built it. And I get why, 'cuz every second brain setup ends the same way. You open Obsidian, install the plugins, start linking notes and the whole thing's a graveyard in a few weeks. The problem isn't the tool, it's that you are having to be the librarian. AI can fix that.
+
+So, what Andrej Karpathy has figured out is dead simple. Three folders, one file. You dump information in, articles, files, notes, whatever. You don't organize it. The AI reads it, links it, summarizes it into a wiki. Day one, it's simple. Day 100, it's a compounding incredible asset that no one else can replicate.
+
+So, I built mine in 45 minutes on a Saturday morning in Claude Co-work. If you fancy it, I'll show you how to do it on a Systems Made Better on YouTube.
+
+--------------------------------------------------------------------------------
+
+Video description:
+Watch the full demo here https://youtu.be/ib74sLgjIBM and download the system here: https://bettercreating.com/coworkos
+
+Everything I learn gets stored, organised, and connected inside Claude, so when I ask for help, it's working from years of accumulated context instead of a blank page.
+
+Articles, notes, documents, ideas, projects, resources... all feeding into a second brain that becomes more useful over time.
+
+It's inspired by Andrej Karpathy's setup and you can replicate this for yourself. Check out the full video on my channel to get started!

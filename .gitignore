@@ -1,0 +1,48 @@
+# .brain/ embeddings database — sqlite-vec binary blob, regenerable
+.brain/embeddings.db
+.brain/embeddings.db-*
+
+# .brain/ cache — transient inference cache
+.brain/cache/
+
+# .brain/ snapshots — pre-rebuild backups (§12.6)
+.brain/snapshots/
+
+# .brain/ deadletter — failed extractions
+.brain/deadletter/
+
+# .brain/ quarantine — low-confidence extractions
+.brain/quarantine/
+
+# .brain/ golden — golden test set (populated later)
+.brain/golden/
+
+# Python virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Python build artifacts (from `pip install -e .`)
+*.egg-info/
+build/
+dist/
+
+# Environment overrides
+.env
+
+# Local config overrides (never committed)
+*.local.toml
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Inbox — binary originals bloat git (§12.8)
+00-inbox/
+
+# --- TRACKED EXPLICITLY (do NOT ignore) ---
+# .brain/state.json  — topic graph + source registry
+# .brain/changelog.jsonl  — append-only audit log
