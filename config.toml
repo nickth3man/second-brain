@@ -1,0 +1,153 @@
+# ============================================================================
+# Second Brain — central configuration
+# ----------------------------------------------------------------------------
+# Swap ANY model here to test alternatives. All model IDs are OpenRouter
+# slugs (browse at https://openrouter.ai/models). This is the single place
+# to retarget the whole pipeline.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# OpenRouter connection
+# ----------------------------------------------------------------------------
+[openrouter]
+base_url = "https://openrouter.ai/api/v1"
+# The app reads env var OPENROUTER_API_KEY first, then falls back to this.
+# Private machine — paste your key inline for convenience, or leave as-is
+# and export the env var.
+api_key = "sk-or-v1-PASTE_YOUR_KEY_HERE"
+
+# ----------------------------------------------------------------------------
+# Models — swap freely to test
+# Each stage can use a different model. Point them all at the same slug for a
+# single-model setup, or split them for tiered cost/quality.
+# ----------------------------------------------------------------------------
+[models]
+# Stage model slugs (OpenRouter). Swap any to test — these are research-recommended
+# defaults; override with your preferred models. See ARCHITECTURE.md §6 / §12.
+
+# Workhorse: extraction, summarization, topic linking, wiki synthesis.
+# NOTE: claude-sonnet-4.5+ required for reliable structured outputs (§12.2);
+#       3.5-sonnet predates strict json_schema support.
+text = "anthropic/claude-sonnet-4.5"
+# Alternatives: "openai/gpt-4o", "google/gemini-2.5-flash", "deepseek/deepseek-chat"
+
+# Multimodal: PDF page OCR, standalone images, video keyframes.
+vision = "openai/gpt-4o"
+# Alternatives: "anthropic/claude-sonnet-4.5", "google/gemini-2.5-flash"
+
+# Embeddings: topic similarity / rerank matching (>= merge_threshold merges).
+embedding = "openai/text-embedding-3-small"
+# Alternatives: "baai/bge-m3" ($0.01/M, multilingual), "google/gemini-embedding-2" (multimodal)
+
+# Speech-to-text: audio & video. whisper-1 has NO ZDR endpoint (§12.7), so the
+# default is whisper-large-v3 (ZDR via Groq/Together). ffmpeg-chunked for
+# resumability on long files (§12.7).
+stt = "openai/whisper-large-v3"
+# Alternatives: "microsoft/mai-transcribe-1.5" (Azure ZDR), or send audio as
+#   input_audio to "google/gemini-2.5-flash" + "transcribe" prompt.
+
+# Chat (agentic RAG, §10/§12.4): MUST surface reasoning_details — use
+# Anthropic / DeepSeek / Gemini. Do NOT use OpenAI o-series (hides reasoning).
+chat = "anthropic/claude-sonnet-4.5"
+# Alternatives: "deepseek/deepseek-r1" (raw reasoning trace), "google/gemini-2.5-pro"
+
+# Evals judge (§12.5): MUST be a DIFFERENT family than text/chat to avoid
+# self-approval bias (~10-15% inflated). If text=Anthropic, judge=OpenAI.
+judge = "openai/gpt-4o"
+
+# ----------------------------------------------------------------------------
+# Ingestion parameters
+# ----------------------------------------------------------------------------
+[ingestion]
+# Rerank similarity threshold for merging into an existing topic (0.0-1.0).
+merge_threshold = 0.70
+
+# DPI for rendering PDF pages to images before vision OCR.
+# 200 = good OCR balance; bump to 300 for dense / small text.
+pdf_dpi = 200
+
+# Vision OCR image format. png = lossless (best OCR); jpeg = smaller / cheaper.
+pdf_image_format = "png"
+
+# Strip alpha channel when rendering PDF pages (vision models don't use it,
+# cuts PNG size ~30%). Renderer = PyMuPDF (pip install pymupdf, zero system deps).
+pdf_alpha = false
+
+# OpenRouter vision providers cap images per request (often 8). Send pages
+# one-per-request, sequentially. This matches the synchronous pipeline.
+vision_max_images_per_request = 8
+
+# Vision models downscale internally to ~2048px longest edge. Downscale larger
+# renders before sending to save tokens.
+vision_max_edge_px = 2048
+
+# Soft cap on audio/video length (minutes) before warning about cost/time.
+max_audio_minutes = 120
+
+# ----------------------------------------------------------------------------
+# File-type routing (lowercase extensions, no leading dot).
+# Edit only if you add new types. Each maps to a stage in the pipeline.
+# ----------------------------------------------------------------------------
+[types]
+text       = ["md", "txt", "markdown", "rst"]
+code       = ["py", "js", "ts", "tsx", "jsx", "go", "rs", "java", "c", "cpp", "h", "hpp", "rb", "php", "sh", "bash", "sql"]
+structured = ["json", "yaml", "yml", "toml", "csv"]
+vision     = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"]
+pdf        = ["pdf"]
+office     = ["docx", "doc", "odt", "rtf", "xlsx", "xls", "pptx", "ppt"]
+web        = ["html", "htm"]
+ebook      = ["epub"]
+audio      = ["mp3", "m4a", "wav", "aac", "ogg", "flac"]
+video      = ["mp4", "mov", "mkv", "webm", "avi"]
+
+# ----------------------------------------------------------------------------
+# Privacy & security (§12.7) — OpenRouter-only, ZDR on every request
+# ----------------------------------------------------------------------------
+[privacy]
+# Zero-Data-Retention: route only to endpoints with a "no storage" contract.
+# Stronger than data_collection="deny" (which only blocks training). Applied to
+# EVERY request. Also enable the 4 model-group ZDR toggles at
+# openrouter.ai/settings/privacy (one-time; `brain init` reminds you).
+zdr = true
+block_training_providers = true
+
+# No PII redaction (destroys extraction quality). Instead, flag sensitive files
+# by path — anything under these globs gets the strictest ZDR routing.
+# (5no: no local-model fallback — sensitive media routes to ZDR cloud.)
+sensitive_patterns = ["sensitive/", "private/"]
+
+# API key resolution order: keyring (Windows Credential Manager) -> env -> config.
+# `brain init` writes the key to keyring. Set "config" to use [openrouter].api_key.
+api_key_source = "keyring"
+
+# ----------------------------------------------------------------------------
+# Structured-output extraction (§12.2) — librarian reliability
+# ----------------------------------------------------------------------------
+[extraction]
+primary_model = ""                        # empty = use [models].text
+repair_model = "google/gemini-2.5-flash"  # cheap fallback for repair passes
+max_attempts = 3                          # per model, before fall-through
+enable_healing = true                     # OpenRouter response-healing plugin (free)
+require_parameters = true                 # refuse silent fallback to non-strict models
+confidence_floor = 0.6                    # all topics < floor -> quarantine, no merge
+deadletter_dir = ".brain/deadletter"
+quarantine_dir = ".brain/quarantine"
+
+# ----------------------------------------------------------------------------
+# Observability & evals (§12.5) — MVP slice (4a): measured, never gated
+# ----------------------------------------------------------------------------
+[eval]
+# L0 structural invariants + L1 heuristics run every ingest (free, code-only).
+# Below: the 3 headline metrics, sampled. L2-L4 deferred until ~50+ sources.
+sample_chat_faithfulness = 0.05     # fraction of chat answers judged (RAGAS)
+sample_merge_reversibility = 0.05   # fraction of merges checked for info loss
+cost_alert_daily_usd = 5.0          # health-panel alert if daily spend exceeds
+golden_set_dir = ".brain/golden"    # populated later (L4); empty for now
+
+# ----------------------------------------------------------------------------
+# Versioning (§12.8) — git the brain
+# ----------------------------------------------------------------------------
+[git]
+enabled = true
+ignore_inbox = true            # binary originals bloat .git; back up separately
+commit_on_compaction = true
