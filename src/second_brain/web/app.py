@@ -13,11 +13,13 @@ Bound to 127.0.0.1 only (§12.7).
 
 from __future__ import annotations
 
+import json
 import textwrap
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -248,6 +250,69 @@ def create_app(cfg=None) -> FastAPI:
                 "report": report,
                 "health_md": health_md,
             },
+        )
+
+    # -- chat routes (Phase 6, §10, §12.4) -------------------------------
+
+    @app.get("/chat", response_class=HTMLResponse)
+    async def chat_page(request: Request) -> HTMLResponse:
+        """Render the chat UI page."""
+        return templates.TemplateResponse(request, "chat.html", {})
+
+    @app.get("/api/chat")
+    async def chat_api(q: str = Query("", min_length=0)) -> StreamingResponse:
+        """SSE endpoint for the chat agent.
+
+        Returns a ``text/event-stream`` with typed events matching §12.4.
+        """
+        if not q.strip():
+            empty = json.dumps(
+                {"type": "done", "error": "empty query"}, ensure_ascii=False
+            )
+            return StreamingResponse(
+                iter([f"data: {empty}\n\n"]),
+                media_type="text/event-stream",
+            )
+
+        from second_brain.chat import chat_stream
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.vectors.embed import Embedder
+        from second_brain.vectors.store import VectorStore
+
+        async def event_gen() -> AsyncGenerator[str, None]:
+            client: OpenRouterClient | None = None
+            vec_store: VectorStore | None = None
+            try:
+                client = OpenRouterClient(cfg)
+                embedder = Embedder(client, cfg)
+                dim = await embedder.ensure_dim()
+                vec_store = VectorStore(
+                    cfg.brain_root / ".brain/embeddings.db",
+                    cfg.models.embedding,
+                    dim=dim,
+                )
+                store = _store_singleton()
+
+                async for event in chat_stream(
+                    q.strip(), cfg, store, vec_store, embedder, client, k=8
+                ):
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as exc:
+                # No API key / model error / etc. -> end the stream gracefully
+                # so the client always receives a terminal event.
+                err = json.dumps(
+                    {"type": "done", "error": str(exc)}, ensure_ascii=False
+                )
+                yield f"data: {err}\n\n"
+            finally:
+                if vec_store is not None:
+                    vec_store.close()
+                if client is not None:
+                    await client.close()
+
+        return StreamingResponse(
+            event_gen(),
+            media_type="text/event-stream",
         )
 
     return app

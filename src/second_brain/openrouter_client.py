@@ -11,7 +11,9 @@ Phase 3 Wave 1 per §6 and §12.7.
 from __future__ import annotations
 
 import base64
+import json
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -271,6 +273,62 @@ class OpenRouterClient:
             )
         resp.raise_for_status()
         return resp.json()
+
+    async def chat_completion_stream(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        extra_body: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream a chat completion via SSE (Phase 6).
+
+        POSTs to ``/chat/completions`` with ``stream=True`` and yields
+        content deltas as they arrive.
+
+        Args:
+            model: OpenRouter model slug.
+            messages: Chat messages in OpenAI format.
+            extra_body: Additional fields merged into the request body.
+
+        Yields:
+            Content string deltas from ``choices[0].delta.content``.
+
+        Raises:
+            CreditExhaustedError: on HTTP 402.
+            httpx.HTTPStatusError: on other HTTP errors.
+        """
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "provider": self._zdr_provider(),
+        }
+        if extra_body:
+            body.update(extra_body)
+
+        async with self.client.stream("POST", "/chat/completions", json=body) as resp:
+            if resp.status_code == 402:
+                raise CreditExhaustedError(
+                    "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
+                )
+            resp.raise_for_status()
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):]
+                if payload.strip() == "[DONE]":
+                    return
+                data = json.loads(payload)
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content")
+                if content is None:
+                    continue
+                yield content
 
     async def embedding(self, model: str, input: str | list[str]) -> list[float]:
         """POST /embeddings and return the embedding vector.

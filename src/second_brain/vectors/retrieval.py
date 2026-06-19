@@ -79,7 +79,13 @@ async def search_brain(
     """
     qvec = await embedder.embed_query(query)
     vhits = store.vector_search_chunks(qvec, k=merge_k)
-    fhits = store.fts_search(query, k=merge_k)
+    try:
+        fhits = store.fts_search(query, k=merge_k)
+    except Exception:
+        # FTS5 has its own query syntax; raw user input with punctuation
+        # (e.g. "what is RAG?") can raise a syntax error. Fall back to
+        # vector-only results so search never fails on a weird query.
+        fhits = []
     fused = reciprocal_rank_fusion(vhits, fhits)[:k]
 
     results: list[SearchHit] = []

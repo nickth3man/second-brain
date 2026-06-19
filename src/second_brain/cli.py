@@ -273,6 +273,68 @@ def serve(
 
 
 @app.command()
-def ask() -> None:
-    """Ask a question via the chat interface (Phase 6)."""
-    typer.echo("Not yet implemented (Phase 6).")
+def ask(
+    query: Annotated[str, typer.Argument(help="Question to ask the brain.")],
+) -> None:
+    """Ask a question via the chat agent (Phase 6)."""
+
+    async def _ask() -> None:
+        from second_brain.chat import chat_stream
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.state import BrainStateStore
+        from second_brain.vectors.embed import Embedder
+        from second_brain.vectors.store import VectorStore
+
+        cfg = load_config()
+        client = OpenRouterClient(cfg)
+        try:
+            embedder = Embedder(client, cfg)
+            dim = await embedder.ensure_dim()
+            vec_store = VectorStore(
+                cfg.brain_root / ".brain/embeddings.db",
+                cfg.models.embedding,
+                dim=dim,
+            )
+            store = BrainStateStore.load(cfg)
+            try:
+                async for event in chat_stream(
+                    query, cfg, store, vec_store, embedder, client, k=8
+                ):
+                    t = event["type"]
+                    if t == "thinking":
+                        typer.echo("[thinking] " + event["content"])
+                    elif t == "tool_call":
+                        typer.echo(
+                            "[tool] " + event["tool"]
+                            + " -> args=" + str(event["args"])
+                        )
+                    elif t == "tool_result":
+                        hits = event.get("hits", [])
+                        err = event.get("error")
+                        if err:
+                            typer.echo(
+                                "[tool] " + event["tool"]
+                                + " -> error=" + err
+                            )
+                        else:
+                            typer.echo(
+                                "[tool] " + event["tool"]
+                                + " -> " + str(len(hits)) + " hits"
+                            )
+                            for h in hits:
+                                typer.echo(
+                                    "  " + h["source_id"]
+                                    + " topic=" + str(h["topic_slug"])
+                                    + " score=" + str(h["score"])
+                                )
+                    elif t == "answer_delta":
+                        typer.echo(event["content"], nl=False)
+                    elif t == "done":
+                        typer.echo("")
+                        typer.echo("[done]")
+            finally:
+                vec_store.close()
+        finally:
+            await client.close()
+
+    asyncio.run(_ask())

@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Chat — Second Brain{% endblock %}
+{% block head %}
+<style>
+  #chat-log { max-height: 70vh; overflow-y: auto; border: 1px solid #ccc; padding: 0.5em; margin-bottom: 0.5em; }
+  .event-thinking { color: #888; font-style: italic; }
+  .event-tool { color: #555; font-size: 0.9em; }
+  .event-tool-result { color: #555; font-size: 0.9em; }
+  .answer-bubble { background: #eef; padding: 0.3em 0.6em; border-radius: 6px; margin: 0.2em 0; white-space: pre-wrap; }
+  .hit-item { margin-left: 1em; }
+  #chat-form { display: flex; gap: 0.3em; }
+  #chat-input { flex: 1; }
+</style>
+{% endblock %}
+{% block content %}
+<h1>Chat with your Brain</h1>
+<div id="chat-log"></div>
+<form id="chat-form">
+  <input id="chat-input" type="text" placeholder="Ask anything..." autofocus>
+  <button type="submit">Send</button>
+</form>
+<script>
+(function() {
+  const log = document.getElementById('chat-log');
+  const form = document.getElementById('chat-form');
+  const input = document.getElementById('chat-input');
+  let currentAnswer = null;
+
+  function addLine(cls, html) {
+    const div = document.createElement('div');
+    div.className = cls;
+    div.innerHTML = html;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    const q = input.value.trim();
+    if (!q) return;
+    input.disabled = true;
+    currentAnswer = null;
+
+    // Append user message
+    addLine('', '<strong>You:</strong> ' + escapeHtml(q));
+
+    const es = new EventSource('/api/chat?q=' + encodeURIComponent(q));
+
+    es.addEventListener('message', function(ev) {
+      const data = JSON.parse(ev.data);
+      switch (data.type) {
+        case 'thinking':
+          addLine('event-thinking', '[Thinking] ' + escapeHtml(data.content));
+          break;
+        case 'tool_call':
+          addLine('event-tool', '[Tool] ' + escapeHtml(data.tool) + '(' + JSON.stringify(data.args) + ')');
+          break;
+        case 'tool_result':
+          var html = '[Result] ' + escapeHtml(data.tool) + ': ' + (data.hits ? data.hits.length : 0) + ' hits';
+          if (data.error) html += ' (error: ' + escapeHtml(data.error) + ')';
+          addLine('event-tool-result', html);
+          if (data.hits) {
+            data.hits.forEach(function(h) {
+              addLine('hit-item', '&nbsp;&nbsp;topic=' + escapeHtml(h.topic_slug) + ' score=' + h.score.toFixed(4));
+            });
+          }
+          break;
+        case 'answer_delta':
+          if (!currentAnswer) {
+            currentAnswer = document.createElement('div');
+            currentAnswer.className = 'answer-bubble';
+            log.appendChild(currentAnswer);
+          }
+          currentAnswer.textContent += data.content;
+          log.scrollTop = log.scrollHeight;
+          break;
+        case 'done':
+          es.close();
+          input.disabled = false;
+          input.value = '';
+          input.focus();
+          currentAnswer = null;
+          break;
+      }
+    });
+
+    es.addEventListener('error', function() {
+      es.close();
+      input.disabled = false;
+      currentAnswer = null;
+    });
+  });
+
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+})();
+</script>
+{% endblock %}
