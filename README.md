@@ -5,8 +5,8 @@ dump information unstructured into the inbox; let the AI act as the librarian
 that reads, links, and summarizes it into a living wiki. Value compounds over
 time.
 
-**Status: Phase 0 scaffold** — config loader, OpenRouter client, keyring
-integration, folder init. Ingestion daemon coming in Phase 1.
+**Status: Phases 0–1 complete** — scaffold + the text-only ingestion loop
+(watcher → extract → wiki → INDEX). Phase 2 (embeddings & retrieval) in progress.
 
 ## Quick start
 
@@ -18,6 +18,9 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -e .
+
+# Create your config from the tracked template, then add your OpenRouter key:
+cp config.example.toml config.toml   # Windows: copy config.example.toml config.toml
 brain init
 ```
 
@@ -26,12 +29,13 @@ required folder structure.
 
 ## Configuration
 
-All models and parameters live in [`config.toml`](config.toml). Swap any
-model, adjust ingestion settings, or change privacy behaviour without touching
-code. See [`ARCHITECTURE.md`](ARCHITECTURE.md) §9 for details.
+`config.toml` holds your models and parameters — it is **gitignored** because it
+contains your API key. The tracked [`config.example.toml`](config.example.toml)
+is the template; copy it to `config.toml` and edit. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §9 for every slot.
 
 API keys are resolved via Windows Credential Manager (keyring) → environment
-variable → config file (§12.7).
+variable → config file (§12.7). `brain init` writes the key to the keyring.
 
 ## Source of truth
 

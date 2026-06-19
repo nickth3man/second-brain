@@ -46,3 +46,7 @@ dist/
 # --- TRACKED EXPLICITLY (do NOT ignore) ---
 # .brain/state.json  — topic graph + source registry
 # .brain/changelog.jsonl  — append-only audit log
+
+# Real config — contains the user's API key + model choices (gitignored).
+# Copy config.example.toml -> config.toml and fill in your key.
+config.toml
