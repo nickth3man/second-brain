@@ -32,8 +32,6 @@ async def parse_to_markdown(
         The parsed markdown body.
 
     Raises:
-        NotImplementedError: if *stage* is a Wave-2 stage (pdf, vision, audio,
-            video).
         ValueError: if *stage* is unknown.
     """
     if stage in {"text", "code", "structured"}:
@@ -56,7 +54,24 @@ async def parse_to_markdown(
 
         return await parse_ebook(path)
 
-    if stage in {"pdf", "vision", "audio", "video"}:
-        raise NotImplementedError(f"{stage} parsing arrives in Phase 3 Wave 2")
+    if stage == "pdf":
+        from second_brain.parse.pdf import parse_pdf
+
+        return await parse_pdf(path, cfg, client)
+
+    if stage == "vision":
+        from second_brain.parse.image import parse_image
+
+        return await parse_image(path, cfg, client)
+
+    if stage == "audio":
+        from second_brain.parse.audio import parse_audio
+
+        return await parse_audio(path, cfg, client)
+
+    if stage == "video":
+        from second_brain.parse.video import parse_video
+
+        return await parse_video(path, cfg, client)
 
     raise ValueError(f"Unknown pipeline stage: {stage}")

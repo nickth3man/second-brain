@@ -312,17 +312,6 @@ class TestParseDispatch:
         result = await parse_to_markdown(epub, "ebook", cfg, client)
         assert "Ebook text." in result
 
-    async def test_wave2_stages_raise_not_implemented(self, tmp_path: Path) -> None:
-        from second_brain.parse import parse_to_markdown
-
-        p = tmp_path / "dummy.txt"
-        p.write_text("x", encoding="utf-8")
-        cfg = _FakeCfg(brain_root=tmp_path)
-        client = _FakeClient()
-        for stage in ("pdf", "vision", "audio", "video"):
-            with pytest.raises(NotImplementedError, match="Phase 3 Wave 2"):
-                await parse_to_markdown(p, stage, cfg, client)
-
     async def test_unknown_stage_raises_value_error(self, tmp_path: Path) -> None:
         from second_brain.parse import parse_to_markdown
 

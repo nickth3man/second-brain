@@ -19,6 +19,7 @@ dependencies = [
     "tenacity",
     "sqlite-vec",
     "numpy",
+    "pymupdf",
     "mammoth",
     "readability-lxml",
 ]
