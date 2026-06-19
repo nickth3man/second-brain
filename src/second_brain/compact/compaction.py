@@ -127,11 +127,11 @@ async def _rewrite_synthesis(
         "redundancy.\n\n"
         f"Pages: {synthesis_a} / {synthesis_b}"
     )
-    result = await client.chat_completion(
+    _, clean_content = await client.chat_completion_clean(
         cfg.models.text,
         [{"role": "user", "content": prompt}],
     )
-    return result["choices"][0]["message"]["content"]
+    return clean_content
 
 
 # ---------------------------------------------------------------------------

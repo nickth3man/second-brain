@@ -52,6 +52,9 @@
         case 'thinking':
           addLine('event-thinking', '[Thinking] ' + escapeHtml(data.content));
           break;
+        case 'reasoning_delta':
+          addLine('event-thinking', '(think) ' + escapeHtml(data.content));
+          break;
         case 'tool_call':
           addLine('event-tool', '[Tool] ' + escapeHtml(data.tool) + '(' + JSON.stringify(data.args) + ')');
           break;

@@ -30,8 +30,10 @@ async def chat_stream(
     1. ``thinking`` — reasoning-in-progress status.
     2. ``tool_call`` — the search_brain invocation.
     3. ``tool_result`` — the retrieved hits (or error).
-    4. ``answer_delta`` — one or more content tokens from the LLM.
-    5. ``done`` — stream complete.
+    4. ``reasoning_delta`` — zero or more model CoT tokens (only on
+       reasoning models; interleaved with ``answer_delta``).
+    5. ``answer_delta`` — one or more content tokens from the LLM.
+    6. ``done`` — stream complete.
 
     Args:
         query: The user's question.
@@ -103,9 +105,12 @@ async def chat_stream(
         {"role": "user", "content": user_content},
     ]
 
-    # 5. Stream answer deltas
-    async for delta in client.chat_completion_stream(cfg.models.chat, messages):
-        yield {"type": "answer_delta", "content": delta}
+    # 5. Stream answer deltas (with optional reasoning from reasoning models)
+    async for piece in client.chat_completion_stream(cfg.models.chat, messages):
+        if piece.get("reasoning"):
+            yield {"type": "reasoning_delta", "content": piece["reasoning"]}
+        if piece.get("content"):
+            yield {"type": "answer_delta", "content": piece["content"]}
 
     # 6. done
     yield {"type": "done"}

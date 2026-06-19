@@ -21,6 +21,7 @@ import httpx
 import keyring
 
 from second_brain.config import Config
+from second_brain.reasoning import ThinkSplitter, strip_think
 
 # -- exceptions --------------------------------------------------------------
 
@@ -183,7 +184,10 @@ class OpenRouterClient:
                 "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
             )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        raw = resp.json()["choices"][0]["message"]["content"]
+        # Strip <think>...</think> — reasoning models leak CoT into content.
+        _, clean_content = strip_think(raw)
+        return clean_content
 
     async def transcribe(
         self,
@@ -274,17 +278,45 @@ class OpenRouterClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def chat_completion_clean(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> tuple[str | None, str]:
+        """Like :meth:`chat_completion` but strips ``<think>`` from content.
+
+        Returns:
+            ``(reasoning, clean_content)`` — the ``<think>`` block (if any)
+            is separated as *reasoning* and the remainder as *clean_content*.
+        """
+        resp = await self.chat_completion(
+            model,
+            messages,
+            response_format=response_format,
+            extra_body=extra_body,
+        )
+        raw = resp["choices"][0]["message"]["content"]
+        return strip_think(raw)
+
     async def chat_completion_stream(
         self,
         model: str,
         messages: list[dict[str, Any]],
         *,
         extra_body: dict[str, Any] | None = None,
-    ) -> AsyncIterator[str]:
-        """Stream a chat completion via SSE (Phase 6).
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream a chat completion via SSE (Phase 6), separating reasoning.
 
         POSTs to ``/chat/completions`` with ``stream=True`` and yields
-        content deltas as they arrive.
+        dicts with ``"reasoning"`` and ``"content"`` keys (one of which
+        may be ``None`` per yield).
+
+        If the API provides a structured ``delta.reasoning`` field it is
+        used directly; otherwise any ``<think>...</think>`` block found in
+        ``delta.content`` is stripped client-side via :class:`ThinkSplitter`.
 
         Args:
             model: OpenRouter model slug.
@@ -292,7 +324,7 @@ class OpenRouterClient:
             extra_body: Additional fields merged into the request body.
 
         Yields:
-            Content string deltas from ``choices[0].delta.content``.
+            ``{"reasoning": str | None, "content": str | None}`` dicts.
 
         Raises:
             CreditExhaustedError: on HTTP 402.
@@ -307,6 +339,8 @@ class OpenRouterClient:
         if extra_body:
             body.update(extra_body)
 
+        splitter = ThinkSplitter()
+
         async with self.client.stream("POST", "/chat/completions", json=body) as resp:
             if resp.status_code == 402:
                 raise CreditExhaustedError(
@@ -319,16 +353,33 @@ class OpenRouterClient:
                     continue
                 payload = line[len("data: "):]
                 if payload.strip() == "[DONE]":
-                    return
+                    break
                 data = json.loads(payload)
                 choices = data.get("choices", [])
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
-                content = delta.get("content")
-                if content is None:
-                    continue
-                yield content
+                api_reasoning: str | None = delta.get("reasoning")
+                content: str | None = delta.get("content")
+
+                if api_reasoning:
+                    yield {"reasoning": api_reasoning, "content": None}
+
+                if content:
+                    for r_piece, c_piece in splitter.feed(content):
+                        if api_reasoning:
+                            # API already covered reasoning; don't duplicate.
+                            if c_piece:
+                                yield {"reasoning": None, "content": c_piece}
+                        else:
+                            yield {"reasoning": r_piece, "content": c_piece}
+
+        # Flush any remaining buffered text.
+        r_remainder, c_remainder = splitter.flush()
+        if r_remainder:
+            yield {"reasoning": r_remainder, "content": None}
+        if c_remainder:
+            yield {"reasoning": None, "content": c_remainder}
 
     async def embedding(self, model: str, input: str | list[str]) -> list[float]:
         """POST /embeddings and return the embedding vector.

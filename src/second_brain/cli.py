@@ -303,6 +303,8 @@ def ask(
                     t = event["type"]
                     if t == "thinking":
                         typer.echo("[thinking] " + event["content"])
+                    elif t == "reasoning_delta":
+                        typer.echo("(think) " + event["content"], nl=False)
                     elif t == "tool_call":
                         typer.echo(
                             "[tool] " + event["tool"]

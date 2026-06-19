@@ -131,6 +131,19 @@ class FakeClient:
     ) -> dict:
         return self.payload
 
+    async def chat_completion_clean(
+        self,
+        model: str,  # noqa: ARG002
+        messages: list[dict],  # noqa: ARG002
+        *,
+        response_format: dict | None = None,  # noqa: ARG002
+        extra_body: dict | None = None,  # noqa: ARG002
+    ) -> tuple[str | None, str]:
+        from second_brain.reasoning import strip_think
+
+        content = self.payload["choices"][0]["message"]["content"]
+        return strip_think(content)
+
     async def close(self) -> None:
         pass
 

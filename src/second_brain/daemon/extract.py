@@ -133,6 +133,9 @@ async def extract(
             extra_body=extra_body,
         )
         content = resp["choices"][0]["message"]["content"]
+        # Structured output (json_schema) is self-protecting: a leading
+        # <think>...</think> would break JSON parse -> existing repair
+        # fallback handles it. No need to strip here.
         return LibrarianOutput.model_validate_json(content)
 
     # -- Primary attempt ------------------------------------------------

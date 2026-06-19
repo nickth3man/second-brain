@@ -28,7 +28,7 @@ DIM = 8
 
 
 class FakeStreamClient:
-    """Fake OpenRouterClient that returns canned streaming deltas."""
+    """Fake OpenRouterClient that returns canned streaming deltas (dict format)."""
 
     def __init__(self) -> None:
         self.chat_calls: list[tuple[str, list[dict]]] = []
@@ -39,10 +39,20 @@ class FakeStreamClient:
         messages: list[dict[str, Any]],
         *,
         extra_body: dict[str, Any] | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, Any]]:
         self.chat_calls.append((model, messages))
         for chunk in ["Hello", ", ", "world."]:
-            yield chunk
+            yield {"reasoning": None, "content": chunk}
+
+    async def chat_completion_clean(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> tuple[str | None, str]:
+        return (None, "Hello, world.")
 
     async def close(self) -> None:
         pass
@@ -216,6 +226,219 @@ class TestEventSequence:
         assert answer == "Hello, world."
 
         vec_store.close()
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-specific fakes
+# ---------------------------------------------------------------------------
+
+
+class FakeStreamReasoningClient:
+    """Fake that streams reasoning via ``delta.reasoning``, then clean answer."""
+
+    def __init__(self) -> None:
+        self.chat_calls: list[tuple[str, list[dict]]] = []
+
+    async def chat_completion_stream(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        extra_body: dict[str, Any] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.chat_calls.append((model, messages))
+        yield {"reasoning": "thinking...", "content": None}
+        yield {"reasoning": None, "content": "answer"}
+
+    async def close(self) -> None:
+        pass
+
+
+class FakeStreamThinkLeakClient:
+    """Fake that simulates a model leaking ``<think>`` (minimax-style).
+
+    The fake chat_completion_stream uses ThinkSplitter internally (as the
+    real client does), yielding already-separated reasoning/content dicts.
+    """
+
+    def __init__(self) -> None:
+        self.chat_calls: list[tuple[str, list[dict]]] = []
+
+    async def chat_completion_stream(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        extra_body: dict[str, Any] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        from second_brain.reasoning import ThinkSplitter
+
+        self.chat_calls.append((model, messages))
+        splitter = ThinkSplitter()
+        # Use no trailing whitespace for deterministic test expectations.
+        raw_content = "<think>deep</think>answer"
+        for r_piece, c_piece in splitter.feed(raw_content):
+            if r_piece:
+                yield {"reasoning": r_piece, "content": None}
+            if c_piece:
+                yield {"reasoning": None, "content": c_piece}
+        r_rem, c_rem = splitter.flush()
+        if r_rem:
+            yield {"reasoning": r_rem, "content": None}
+        if c_rem:
+            yield {"reasoning": None, "content": c_rem}
+
+    async def close(self) -> None:
+        pass
+
+
+class FakeClientClean:
+    """Fake that returns raw content with <think> for chat_completion_clean test."""
+
+    def __init__(self) -> None:
+        self.chat_calls: list[tuple[str, list[dict]]] = []
+
+    async def chat_completion(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        stream: bool = False,
+    ) -> Any:
+        self.chat_calls.append((model, messages))
+        return {"choices": [{"message": {"content": "<think>r</think>answer"}}]}
+
+    async def chat_completion_clean(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> tuple[str | None, str]:
+        from second_brain.reasoning import strip_think
+
+        resp = await self.chat_completion(
+            model,
+            messages,
+            response_format=response_format,
+            extra_body=extra_body,
+        )
+        raw = resp["choices"][0]["message"]["content"]
+        return strip_think(raw)
+
+    async def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Reasoning tests
+# ---------------------------------------------------------------------------
+
+
+class TestReasoning:
+    """Verify reasoning_delta emission and clean answer extraction."""
+
+    async def test_reasoning_delta_emitted(self, tmp_path: Path) -> None:
+        """When delta.reasoning is present, reasoning_delta is emitted."""
+        store, vec_store = _seed_store_and_vec(tmp_path)
+        client = FakeStreamReasoningClient()
+        embedder = FakeEmbedder()
+        cfg = SimpleNamespace(
+            models=SimpleNamespace(chat="test-chat-model"),
+        )
+
+        events: list[dict[str, Any]] = []
+        async for ev in chat_stream(
+            "test", cfg, store, vec_store, embedder, client, k=5
+        ):
+            events.append(ev)
+
+        types = [e["type"] for e in events]
+        # Sequence: thinking, tool_call, tool_result, reasoning_delta, answer_delta, done
+        assert types[0] == "thinking"
+        assert types[1] == "tool_call"
+        assert types[2] == "tool_result"
+        assert "reasoning_delta" in types
+        assert "answer_delta" in types
+        assert types[-1] == "done"
+
+        # Verify reasoning_delta content
+        reasoning = "".join(
+            e["content"] for e in events if e["type"] == "reasoning_delta"
+        )
+        assert reasoning == "thinking..."
+
+        # Verify answer content is clean
+        answer = "".join(
+            e["content"] for e in events if e["type"] == "answer_delta"
+        )
+        assert answer == "answer"
+
+        vec_store.close()
+
+    async def test_think_leak_stripped(self, tmp_path: Path) -> None:
+        """When <think> leaks into content, it is stripped, not in answer."""
+        store, vec_store = _seed_store_and_vec(tmp_path)
+        client = FakeStreamThinkLeakClient()
+        embedder = FakeEmbedder()
+        cfg = SimpleNamespace(
+            models=SimpleNamespace(chat="test-chat-model"),
+        )
+
+        events: list[dict[str, Any]] = []
+        async for ev in chat_stream(
+            "test", cfg, store, vec_store, embedder, client, k=5
+        ):
+            events.append(ev)
+
+        # Verify no <think> in any answer_delta
+        for e in events:
+            if e["type"] == "answer_delta":
+                assert "<think>" not in e["content"]
+
+        # Concatenated answer should be clean
+        answer = "".join(
+            e["content"] for e in events if e["type"] == "answer_delta"
+        )
+        assert answer == "answer"
+
+        # Reasoning delta should contain the stripped think block
+        reasoning = "".join(
+            e["content"] for e in events if e["type"] == "reasoning_delta"
+        )
+        assert reasoning == "deep"
+
+        vec_store.close()
+
+    async def test_chat_once_clean_with_think_leak(self, tmp_path: Path) -> None:
+        """chat_once returns only the clean answer (no <think>)."""
+        store, vec_store = _seed_store_and_vec(tmp_path)
+        client = FakeStreamThinkLeakClient()
+        embedder = FakeEmbedder()
+        cfg = SimpleNamespace(
+            models=SimpleNamespace(chat="test-chat-model"),
+        )
+
+        answer = await chat_once(
+            "test", cfg, store, vec_store, embedder, client
+        )
+        assert "<think>" not in answer
+        assert answer == "answer"
+
+        vec_store.close()
+
+    async def test_chat_completion_clean(self) -> None:
+        """chat_completion_clean strips <think> from raw content."""
+        client = FakeClientClean()
+        r, c = await client.chat_completion_clean(
+            "test-model",
+            [{"role": "user", "content": "hello"}],
+        )
+        assert r == "r"
+        assert c == "answer"
 
 
 class TestChatRoutes:
