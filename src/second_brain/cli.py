@@ -7,6 +7,8 @@ Usage::
     brain ingest   # ingest one file (Phase 1/2)
     brain search   # hybrid search (Phase 2)
     brain rebuild  # rebuild wiki (Phase 4)
+    brain compact  # run compaction pass (Phase 4)
+    brain health   # run health check (Phase 4)
     brain ask      # interactive chat (Phase 6)
     brain --version # show version
 """
@@ -170,6 +172,89 @@ def search(
 def rebuild() -> None:
     """Rebuild wiki from sources or inbox (Phase 4)."""
     typer.echo("Not yet implemented (Phase 4).")
+
+
+@app.command()
+def compact() -> None:
+    """Run one compaction pass (Phase 4 — merge similar topics)."""
+
+    async def _compact() -> None:
+        from second_brain.compact.compaction import run_compaction
+        from second_brain.compact.eval import render_health_markdown, run_health_check
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.state import BrainStateStore
+        from second_brain.vectors.embed import Embedder
+        from second_brain.vectors.store import VectorStore
+
+        cfg = load_config()
+        client = OpenRouterClient(cfg)
+        embedder = Embedder(client, cfg)
+        dim = await embedder.ensure_dim()
+        vec_store = VectorStore(
+            cfg.brain_root / ".brain/embeddings.db",
+            cfg.models.embedding,
+            dim=dim,
+        )
+        store = BrainStateStore.load(cfg)
+
+        try:
+            summary = await run_compaction(
+                cfg, store, vec_store, client,
+                merge_threshold=cfg.ingestion.merge_threshold,
+            )
+
+            report = run_health_check(cfg, store)
+            health_md = render_health_markdown(report)
+
+            # Append health section to INDEX.md
+            index_path = cfg.brain_root / "INDEX.md"
+            if index_path.exists():
+                text = index_path.read_text(encoding="utf-8")
+                text += "\n\n" + health_md
+                from second_brain.atomicio import write_atomic
+
+                write_atomic(index_path, text)
+
+            typer.echo(f"Compaction complete: {summary['merges']} merges.")
+            for a, b, sim in summary["pairs"]:
+                typer.echo(f"  {b} -> {a} (sim={sim:.4f})")
+            typer.echo(
+                f"Health: {report['source_count']} sources, "
+                f"{report['topic_count']} topics."
+            )
+        finally:
+            vec_store.close()
+            await client.close()
+
+    asyncio.run(_compact())
+
+
+@app.command()
+def health() -> None:
+    """Run a health check and print a readable summary (Phase 4)."""
+    from second_brain.compact.eval import render_health_markdown, run_health_check
+    from second_brain.state import BrainStateStore
+
+    cfg = load_config()
+    store = BrainStateStore.load(cfg)
+    report = run_health_check(cfg, store)
+
+    typer.echo(f"Sources: {report['source_count']}")
+    typer.echo(f"Topics: {report['topic_count']}")
+
+    o = report["orphans"]
+    typer.echo(
+        f"Orphans: {len(o['sources'])} sources, {len(o['topics'])} topics"
+    )
+    typer.echo(f"Broken links: {len(report['broken_links'])}")
+    typer.echo(f"Empty extractions: {len(report['empty_extractions'])}")
+    typer.echo(f"Stale topics (>90d): {len(report['stale_topics'])}")
+    typer.echo(f"Avg confidence: {report['avg_confidence']:.3f}")
+    typer.echo(f"Schema violations: {len(report['schema_violations'])}")
+
+    health_md = render_health_markdown(report)
+    typer.echo("---")
+    typer.echo(health_md)
 
 
 @app.command()
