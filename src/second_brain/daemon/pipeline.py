@@ -1,11 +1,11 @@
-"""Per-file ingestion pipeline (§5 stages 1–6) and daemon runner (§12.3).
+"""Per-file ingestion pipeline (§5 stages 1–6) and daemon runner (§12.3).
 
 Pipeline stages per file **executed synchronously** (no per-file concurrency):
 
 1. Hash & dedup      — sha256 skip if already seen
 2. Normalise         — write ``50-sources/<id>.md`` with front-matter
-3. Extract           — LLM → structured :class:`LibrarianOutput`
-4. Link              — slug-match → merge or spawn
+3. Extract           — LLM -> structured :class:`LibrarianOutput`
+4. Link              — slug-match or embedding-match -> merge or spawn
 5. Wiki update       — write/merge ``90-wiki/<slug>.md``
 6. Index update      — mark INDEX.md dirty (debounced flush)
 
@@ -26,7 +26,7 @@ import structlog
 from second_brain.config import Config
 from second_brain.daemon.extract import ExtractionError, extract
 from second_brain.daemon.index import DebouncedIndex
-from second_brain.daemon.linker import Linker, SlugLinker
+from second_brain.daemon.linker import EmbeddingLinker, LinkContext, Linker
 from second_brain.daemon.normalize import (
     normalize_text,
     sha256_of_file,
@@ -42,13 +42,15 @@ from second_brain.openrouter_client import (
 )
 from second_brain.slug import slugify
 from second_brain.state import BrainStateStore, now_iso
+from second_brain.vectors.embed import Embedder
+from second_brain.vectors.store import VectorStore
 
 log = structlog.get_logger(__name__)
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 
 
-# ── per-file pipeline ────────────────────────────────────────────────────────
+# -- per-file pipeline --------------------------------------------------------
 
 
 async def ingest_file(
@@ -58,13 +60,20 @@ async def ingest_file(
     client: OpenRouterClient,
     linker: Linker,
     index: DebouncedIndex,
+    *,
+    embedder: Embedder | None = None,
+    vec_store: VectorStore | None = None,
 ) -> IngestStage:
-    """Run the full ingestion pipeline (stages 1–6) on a single file.
+    """Run the full ingestion pipeline (stages 1–6) on a single file.
+
+    Args:
+        embedder: Optional embedding client for Phase 2 chunk embedding.
+        vec_store: Optional vector store for Phase 2 chunk + centroid writes.
 
     Returns:
         The final pipeline stage (``DONE`` or ``FAILED``).
     """
-    # ── Stage 1: Hash & dedup ─────────────────────────────────────────
+    # -- Stage 1: Hash & dedup -----------------------------------------
     body = path.read_text(encoding="utf-8", errors="replace")
     sha = sha256_of_file(path)
 
@@ -98,7 +107,7 @@ async def ingest_file(
         )
         store.transition(source_id, IngestStage.NORMALIZED)
 
-        # ── Stage 2: Normalise ───────────────────────────────────────
+        # -- Stage 2: Normalise ---------------------------------------
         try:
             await normalize_text(
                 path, source_id, sha, ingested, stage, cfg
@@ -117,7 +126,7 @@ async def ingest_file(
             )
             return IngestStage.FAILED
 
-        # ── Stage 3: Extract ─────────────────────────────────────────
+        # -- Stage 3: Extract -----------------------------------------
         store.transition(source_id, IngestStage.EXTRACTED)
         try:
             out = await extract(client, cfg, body, store.all_topic_titles())
@@ -137,11 +146,33 @@ async def ingest_file(
             )
             return IngestStage.FAILED
 
-        # ── Stage 4: Link ────────────────────────────────────────────
-        store.transition(source_id, IngestStage.LINKED)
-        decisions = linker.link(out.topics, store)
+        # -- Phase 2 embedding step (before linking) ------------------
+        source_chunks: list[tuple[str, list[float]]] = []
+        if embedder is not None and vec_store is not None:
+            from second_brain.vectors.store import chunk_text
 
-        # ── Stage 5: Wiki update ─────────────────────────────────────
+            ctexts = chunk_text(body)
+            cvecs = await embedder.embed_texts(ctexts)
+            source_chunks = list(zip(ctexts, cvecs, strict=False))
+
+        # -- Stage 4: Link --------------------------------------------
+        ctx = LinkContext(
+            brain_store=store,
+            embedder=embedder,
+            vec_store=vec_store,
+            source_id=source_id,
+            source_chunks=source_chunks,
+        )
+        decisions = await linker.link(out.topics, ctx)
+        store.transition(source_id, IngestStage.LINKED)
+
+        # Upsert the source's chunks before the per-decision loop
+        if vec_store is not None and source_chunks and decisions:
+            vec_store.upsert_source_chunks(
+                source_id, decisions[0].target_slug, source_chunks
+            )
+
+        # -- Stage 5: Wiki update -------------------------------------
         store.transition(source_id, IngestStage.WIKI_MERGED)
         for decision in decisions:
             store.ensure_topic(
@@ -151,6 +182,8 @@ async def ingest_file(
                 decision.confidence,
             )
             store.add_source_to_topic(decision.target_slug, source_id)
+            if vec_store is not None:
+                vec_store.add_topic_member(decision.target_slug, source_id)
 
             if decision.action == TopicAction.NEW:
                 write_new_topic(
@@ -173,13 +206,18 @@ async def ingest_file(
                     out.tldr,
                 )
 
-            # Detect [[wikilinks]] in merged_section → record graph edges
+            # Detect [[wikilinks]] in merged_section -> record graph edges
             for m in _WIKILINK_RE.findall(decision.merged_section):
                 linked_slug = slugify(m.strip())
                 if linked_slug in store.state.topics:
                     store.record_link(decision.target_slug, linked_slug)
 
-        # ── Stage 6: Index ───────────────────────────────────────────
+        # Recompute centroids for all affected topics
+        if vec_store is not None:
+            for d in decisions:
+                vec_store.recompute_centroid(d.target_slug)
+
+        # -- Stage 6: Index -------------------------------------------
         index.mark_dirty()
         store.transition(source_id, IngestStage.INDEXED)
         store.transition(source_id, IngestStage.DONE)
@@ -223,7 +261,7 @@ def _deadletter(path: Path, cfg: Config) -> None:
     shutil.copy2(path, dead_dir / path.name)
 
 
-# ── daemon runner ────────────────────────────────────────────────────────────
+# -- daemon runner ------------------------------------------------------------
 
 
 async def run_daemon(cfg: Config) -> None:
@@ -237,7 +275,6 @@ async def run_daemon(cfg: Config) -> None:
     _ = OpenRouterClient(cfg)  # resolves API key on first access
 
     store = BrainStateStore.load(cfg)
-    linker: Linker = SlugLinker()
     index = DebouncedIndex(cfg, store)
     queue: asyncio.Queue[Path] = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -247,15 +284,27 @@ async def run_daemon(cfg: Config) -> None:
     log.info("daemon.start", inbox=str(cfg.brain_root / "00-inbox"))
 
     client: OpenRouterClient | None = None
+    vec_store: VectorStore | None = None
     try:
         client = OpenRouterClient(cfg)
+        embedder = Embedder(client, cfg)
+        dim = await embedder.ensure_dim()
+        vec_store = VectorStore(
+            cfg.brain_root / ".brain/embeddings.db",
+            cfg.models.embedding,
+            dim=dim,
+        )
+        linker: Linker = EmbeddingLinker(
+            embedder, vec_store, cfg.ingestion.merge_threshold
+        )
 
         while True:
             path = await queue.get()
             log.info("daemon.ingest", path=str(path))
             try:
                 stage = await ingest_file(
-                    path, cfg, store, client, linker, index
+                    path, cfg, store, client, linker, index,
+                    embedder=embedder, vec_store=vec_store,
                 )
                 log.info("daemon.done", path=str(path), stage=str(stage))
             except CreditExhaustedError:
@@ -268,5 +317,7 @@ async def run_daemon(cfg: Config) -> None:
     finally:
         watcher.stop(observer)
         await index.flush_now()
+        if vec_store is not None:
+            vec_store.close()
         if client is not None:
             await client.close()

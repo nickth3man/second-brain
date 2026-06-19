@@ -4,7 +4,7 @@ Two entry points:
 
 * :func:`write_new_topic` — creates a fresh page.
 * :func:`merge_into_topic` — appends to an existing page (mechanical merge;
-  Phase 4 will add AI-compaction).
+  Phase 4 will add AI-compaction).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from second_brain.models import LinkDecision
 
 
 def _date(iso: str) -> str:
-    """Extract ``YYYY-MM-DD`` from an ISO 8601 string."""
+    """Extract ``YYYY-MM-DD`` from an ISO 8601 string."""
     return iso[:10]
 
 
@@ -63,7 +63,7 @@ def write_new_topic(
         f"## Synthesis\n{decision.merged_section}\n\n"
         f"## Sources\n"
         f"- **[{dt}]** {title}\n"
-        f"  → [source](../50-sources/{source_id}.md)\n"
+        f"  -> [source](../50-sources/{source_id}.md)\n"
         f"  > {tldr}\n\n"
         f"## Open questions\n- \n\n"
         f"## Related\n"
@@ -98,7 +98,7 @@ def merge_into_topic(
     new_synthesis = f"\n\n### From {source_id}\n{decision.merged_section}"
     new_source_entry = (
         f"- **[{dt}]** {existing_title}\n"
-        f"  → [source](../50-sources/{source_id}.md)\n"
+        f"  -> [source](../50-sources/{source_id}.md)\n"
         f"  > {tldr}\n"
     )
 

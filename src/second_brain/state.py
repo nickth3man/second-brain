@@ -21,14 +21,14 @@ from second_brain.models import BrainState, IngestStage, PageType, SourceState, 
 
 log = structlog.get_logger(__name__)
 
-# ── constants ────────────────────────────────────────────────────────────────
+# -- constants ----------------------------------------------------------------
 
 STATE_FILENAME = ".brain/state.json"
 CHANGELOG_FILENAME = ".brain/changelog.jsonl"
 SCHEMA_VERSION = 1
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# -- helpers ------------------------------------------------------------------
 
 
 def now_iso() -> str:
@@ -36,7 +36,7 @@ def now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── BrainStateStore ──────────────────────────────────────────────────────────
+# -- BrainStateStore ----------------------------------------------------------
 
 
 class BrainStateStore:
@@ -53,14 +53,14 @@ class BrainStateStore:
         self.changelog_path: Path = cfg.brain_root / CHANGELOG_FILENAME
         self.state = BrainState()
 
-    # ── load / save ──────────────────────────────────────────────────────
+    # -- load / save ------------------------------------------------------
 
     @classmethod
     def load(cls, cfg: Any) -> BrainStateStore:
         """Create a store and attempt to load state from disk.
 
-        Recovery chain (§12.6): primary → ``.bak`` → ``.bak-1`` → ``.bak-2``
-        → fresh (empty) state.  Logs which fallback was used via structlog.
+        Recovery chain (§12.6): primary -> ``.bak`` -> ``.bak-1`` -> ``.bak-2``
+        -> fresh (empty) state.  Logs which fallback was used via structlog.
 
         The parent directory of the state file is created if it does not exist.
         """
@@ -103,7 +103,7 @@ class BrainStateStore:
         write_json_atomic(self.path, self.state.model_dump(mode="json"))
         rolling_backup(self.path, depth=3)
 
-    # ── source registry ─────────────────────────────────────────────────
+    # -- source registry -------------------------------------------------
 
     def has_source(self, sha256: str) -> bool:
         """Return ``True`` if a source with the given content hash exists."""
@@ -117,7 +117,7 @@ class BrainStateStore:
         """Register (or overwrite) a source entry.  Caller must ``save()``."""
         self.state.sources[source_id] = st
 
-    # ── state machine (§12.3) ───────────────────────────────────────────
+    # -- state machine (§12.3) -------------------------------------------
 
     def transition(
         self,
@@ -138,7 +138,7 @@ class BrainStateStore:
             src.error = error
         self.state.updated = now_iso()
 
-    # ── topic management ────────────────────────────────────────────────
+    # -- topic management ------------------------------------------------
 
     def ensure_topic(
         self,
@@ -213,7 +213,7 @@ class BrainStateStore:
         """Return ``{slug: title}`` for the extract prompt context."""
         return {slug: t.title for slug, t in self.state.topics.items()}
 
-    # ── changelog ───────────────────────────────────────────────────────
+    # -- changelog -------------------------------------------------------
 
     def append_changelog(self, entry: dict) -> None:
         """Append a JSON line to the changelog.

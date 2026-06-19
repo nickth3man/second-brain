@@ -1,4 +1,4 @@
-"""End-to-end tests for Phase 1B (daemon pipeline).
+"""End-to-end tests for Phase 1B (daemon pipeline).
 
 All tests use a fake OpenRouter client — no network, no API key.
 """
@@ -22,7 +22,7 @@ from second_brain.daemon.extract import (
     schema_for_strict,
 )
 from second_brain.daemon.index import DebouncedIndex
-from second_brain.daemon.linker import SlugLinker
+from second_brain.daemon.linker import LinkContext, SlugLinker
 from second_brain.daemon.normalize import (
     estimate_tokens,
     sha256_of_file,
@@ -38,7 +38,7 @@ from second_brain.models import (
 )
 from second_brain.state import BrainStateStore
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers -------------------------------------------------------------------
 
 
 @dataclass
@@ -160,7 +160,7 @@ def _write_inbox(cfg, name: str, content: str) -> Path:
     return p
 
 
-# ── tests ─────────────────────────────────────────────────────────────────────
+# -- tests ---------------------------------------------------------------------
 
 
 class TestRouter:
@@ -199,7 +199,7 @@ class TestNormalize:
         assert "my-test-file" in sid
 
     def test_source_id_fallback(self, tmp_path: Path) -> None:
-        # Stem with only special chars → slugified empty → fallback to body words
+        # Stem with only special chars -> slugified empty -> fallback to body words
         path = tmp_path / "___!!!.md"
         path.write_text("hello world foo bar baz qux", encoding="utf-8")
         sid = source_id_for(path, "hello world foo bar baz qux", "2026-06-19T10:00:00Z")
@@ -219,7 +219,7 @@ class TestNormalize:
 
 class TestExtract:
     def test_build_messages_truncation(self) -> None:
-        long_body = "x" * 100_000  # ~25k tokens → triggers truncation
+        long_body = "x" * 100_000  # ~25k tokens -> triggers truncation
         msgs = build_messages(long_body, {})
         user_msg = msgs[1]["content"]
         assert "[truncated for extraction" in user_msg
@@ -251,7 +251,7 @@ class TestExtract:
 
     @pytest.mark.asyncio
     async def test_extract_total_failure(self, tmp_path: Path) -> None:
-        """Both primary and repair fail → ExtractionError."""
+        """Both primary and repair fail -> ExtractionError."""
         cfg = _make_cfg(tmp_path)
         client = FakeClient(fail_times=2)
         with pytest.raises(ExtractionError):
@@ -259,7 +259,7 @@ class TestExtract:
 
     @pytest.mark.asyncio
     async def test_extract_garbage_json(self, tmp_path: Path) -> None:
-        """Garbage response content → ExtractionError."""
+        """Garbage response content -> ExtractionError."""
         cfg = _make_cfg(tmp_path)
 
         class GarbageClient:
@@ -283,7 +283,8 @@ class TestExtract:
 
 
 class TestSlugLinker:
-    def test_new_topic(self) -> None:
+    @pytest.mark.asyncio
+    async def test_new_topic(self) -> None:
         from second_brain.state import BrainState
 
         store = type("S", (), {"state": BrainState()})()  # empty state
@@ -297,11 +298,12 @@ class TestSlugLinker:
                 merged_section="Some content.",
             )
         ]
-        result = linker.link(decisions, store)
+        result = await linker.link(decisions, LinkContext(brain_store=store))
         assert result[0].action == TopicAction.NEW
         assert result[0].target_slug == "brand-new-concept"
 
-    def test_match_existing(self) -> None:
+    @pytest.mark.asyncio
+    async def test_match_existing(self) -> None:
         from second_brain.models import BrainState, TopicState
 
         state = BrainState()
@@ -319,7 +321,7 @@ class TestSlugLinker:
                 merged_section="Content.",
             )
         ]
-        result = linker.link(decisions, store)
+        result = await linker.link(decisions, LinkContext(brain_store=store))
         assert result[0].action == TopicAction.MATCH
         assert result[0].target_slug == "existing-topic"
 
@@ -491,7 +493,7 @@ class TestPipeline:
 
     @pytest.mark.asyncio
     async def test_extract_failure_pipeline(self, tmp_path: Path) -> None:
-        """Pipeline catches extraction failure → FAILED + deadletter."""
+        """Pipeline catches extraction failure -> FAILED + deadletter."""
         cfg = _make_cfg(tmp_path)
         _ensure_dirs(cfg)
 
@@ -558,7 +560,7 @@ class TestPipeline:
 
     @pytest.mark.asyncio
     async def test_route_unsupported(self, tmp_path: Path) -> None:
-        """Unsupported file types (e.g., .pdf in Phase 1) fail gracefully."""
+        """Unsupported file types (e.g., .pdf in Phase 1) fail gracefully."""
         cfg = _make_cfg(tmp_path)
         _ensure_dirs(cfg)
         client = FakeClient()

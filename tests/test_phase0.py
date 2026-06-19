@@ -11,7 +11,7 @@ from second_brain.atomicio import rolling_backup, write_atomic, write_json_atomi
 from second_brain.config import Config, TypesCfg, ext_to_stage, load_config
 from second_brain.slug import slugify
 
-# ── slugify ─────────────────────────────────────────────────────────────────
+# -- slugify -----------------------------------------------------------------
 
 
 class TestSlugify:
@@ -27,7 +27,7 @@ class TestSlugify:
         assert slugify("Members' NPCs") == "members-npcs"
 
 
-# ── write_atomic ────────────────────────────────────────────────────────────
+# -- write_atomic ------------------------------------------------------------
 
 
 class TestWriteAtomic:
@@ -60,7 +60,7 @@ class TestWriteJsonAtomic:
         assert json.loads(target.read_text()) == obj
 
 
-# ── rolling_backup ──────────────────────────────────────────────────────────
+# -- rolling_backup ----------------------------------------------------------
 
 
 class TestRollingBackup:
@@ -98,7 +98,7 @@ class TestRollingBackup:
         assert not (tmp_path / "nonexistent.json.bak").exists()
 
 
-# ── ext_to_stage ────────────────────────────────────────────────────────────
+# -- ext_to_stage ------------------------------------------------------------
 
 
 @pytest.fixture
@@ -130,15 +130,22 @@ class TestExtToStage:
             ext_to_stage(".xyz", sample_types)
 
 
-# ── load_config ─────────────────────────────────────────────────────────────
+# -- load_config -------------------------------------------------------------
 
 
 class TestLoadConfig:
-    def test_loads_repo_config(self) -> None:
-        """Load the repo's own config.toml and verify key values."""
-        cfg = load_config()
+    def test_loads_repo_config(self, tmp_path: Path) -> None:
+        """Load the tracked config.example.toml (stable fixture) and verify structure.
+
+        config.toml itself is gitignored (holds the user's key + model choices),
+        so we load the tracked template instead of the local user config.
+        """
+        example = Path(__file__).resolve().parents[1] / "config.example.toml"
+        cfg_path = tmp_path / "config.toml"
+        cfg_path.write_text(example.read_text(), encoding="utf-8")
+        cfg = load_config(cfg_path)
         assert isinstance(cfg, Config)
-        assert cfg.models.text == "anthropic/claude-sonnet-4.5"
+        assert cfg.models.text == "anthropic/claude-sonnet-4.5"  # template default
         assert cfg.privacy.zdr is True
         assert cfg.brain_root.exists()
         assert (cfg.brain_root / "config.toml").exists()

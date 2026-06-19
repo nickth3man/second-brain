@@ -4,8 +4,10 @@ Usage::
 
     brain init      # scaffold folders + keyring
     brain watch     # start file-watcher daemon (Phase 1)
-    brain rebuild   # rebuild wiki (Phase 4)
-    brain ask       # interactive chat (Phase 6)
+    brain ingest   # ingest one file (Phase 1/2)
+    brain search   # hybrid search (Phase 2)
+    brain rebuild  # rebuild wiki (Phase 4)
+    brain ask      # interactive chat (Phase 6)
     brain --version # show version
 """
 
@@ -70,7 +72,7 @@ def init() -> None:
 
 @app.command()
 def watch() -> None:
-    """Start the file-watcher daemon (Phase 1 — text-only ingestion loop)."""
+    """Start the file-watcher daemon (Phase 1 — text-only ingestion loop)."""
     from second_brain.daemon.pipeline import run_daemon
 
     cfg = load_config()
@@ -88,27 +90,80 @@ def ingest(
 
     async def _ingest_one() -> str:
         from second_brain.daemon.index import DebouncedIndex
-        from second_brain.daemon.linker import SlugLinker
+        from second_brain.daemon.linker import EmbeddingLinker
         from second_brain.daemon.pipeline import ingest_file
         from second_brain.openrouter_client import OpenRouterClient
         from second_brain.state import BrainStateStore
+        from second_brain.vectors.embed import Embedder
+        from second_brain.vectors.store import VectorStore
 
         cfg = load_config()
         client = OpenRouterClient(cfg)
+        embedder = Embedder(client, cfg)
+        dim = await embedder.ensure_dim()
+        vec_store = VectorStore(
+            cfg.brain_root / ".brain/embeddings.db",
+            cfg.models.embedding,
+            dim=dim,
+        )
         store = BrainStateStore.load(cfg)
-        linker = SlugLinker()
+        linker = EmbeddingLinker(
+            embedder, vec_store, cfg.ingestion.merge_threshold
+        )
         index = DebouncedIndex(cfg, store)
         try:
             stage = await ingest_file(
-                path, cfg, store, client, linker, index
+                path, cfg, store, client, linker, index,
+                embedder=embedder, vec_store=vec_store,
             )
             await index.flush_now()
             return str(stage)
         finally:
+            vec_store.close()
             await client.close()
 
     stage = asyncio.run(_ingest_one())
     typer.echo(f"{path.name}: {stage}")
+
+
+@app.command()
+def search(
+    query: Annotated[str, typer.Argument(help="Search query.")],
+) -> None:
+    """Search the brain using hybrid retrieval (Phase 2)."""
+
+    async def _search() -> None:
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.vectors.embed import Embedder
+        from second_brain.vectors.retrieval import search_brain
+        from second_brain.vectors.store import VectorStore
+
+        cfg = load_config()
+        client = OpenRouterClient(cfg)
+        embedder = Embedder(client, cfg)
+        dim = await embedder.ensure_dim()
+        vec_store = VectorStore(
+            cfg.brain_root / ".brain/embeddings.db",
+            cfg.models.embedding,
+            dim=dim,
+        )
+        try:
+            hits = await search_brain(query, vec_store, embedder, k=5)
+            if not hits:
+                typer.echo("No results.")
+                return
+            for i, hit in enumerate(hits, 1):
+                snippet = hit.text[:120].replace("\n", " ")
+                typer.echo(
+                    f"{i}. [{hit.source_id}] "
+                    f"(topic={hit.topic_slug}, score={hit.score:.4f})\n"
+                    f"   {snippet}\n"
+                )
+        finally:
+            vec_store.close()
+            await client.close()
+
+    asyncio.run(_search())
 
 
 @app.command()

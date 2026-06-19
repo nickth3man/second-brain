@@ -41,7 +41,7 @@ class InboxWatcher(FileSystemEventHandler):
         self.queue = queue
         self.settle = settle_seconds
 
-    # ── event handlers (§12.3: on_created *and* on_moved are first-class) ──
+    # -- event handlers (§12.3: on_created *and* on_moved are first-class) --
 
     def _to_path(self, raw: bytes | str) -> Path:
         """Normalise a watchdog event path (``bytes | str``) to a ``Path``."""
@@ -66,7 +66,7 @@ class InboxWatcher(FileSystemEventHandler):
         if self.inbox in dest.parents:
             self._schedule_stability(dest)
 
-    # ── stability polling ─────────────────────────────────────────────
+    # -- stability polling ---------------------------------------------
 
     def _schedule_stability(self, path: Path) -> None:
         """Run the blocking stability poll in a thread-pool executor."""
@@ -95,7 +95,7 @@ class InboxWatcher(FileSystemEventHandler):
         if s2.st_size == s1.st_size and s2.st_mtime == s1.st_mtime:
             self.loop.call_soon_threadsafe(self.queue.put_nowait, path)
 
-    # ── lifecycle ─────────────────────────────────────────────────────
+    # -- lifecycle -----------------------------------------------------
 
     def start(self) -> Observer:
         """Create, schedule on the inbox directory, and start the observer.

@@ -19,6 +19,7 @@ from second_brain.vectors.embed import Embedder
 from second_brain.vectors.store import (
     CHUNK_OVERLAP_CHARS,
     CHUNK_SIZE_CHARS,
+    VectorDimMismatchError,
     VectorStore,
     chunk_text,
 )
@@ -26,7 +27,7 @@ from second_brain.vectors.store import (
 DIM = 8
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# -- helpers ------------------------------------------------------------------
 
 
 def _vec(seed: int) -> list[float]:
@@ -34,13 +35,13 @@ def _vec(seed: int) -> list[float]:
     return [float(seed + i) for i in range(DIM)]
 
 
-# ── TestVectorStore ──────────────────────────────────────────────────────────
+# -- TestVectorStore ----------------------------------------------------------
 
 
 class TestVectorStore:
     """Real sqlite-vec backed VectorStore tests."""
 
-    # ── 1. Schema + model registry ───────────────────────────────────────
+    # -- 1. Schema + model registry ---------------------------------------
 
     def test_schema_and_model_registry(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -49,8 +50,8 @@ class TestVectorStore:
         assert store.active_dim() == DIM
         store.close()
 
-        store2 = VectorStore(db_path, model="model-b", dim=16)
-        assert store2.active_dim() == 16
+        store2 = VectorStore(db_path, model="model-b", dim=DIM)
+        assert store2.active_dim() == DIM
 
         rows = store2.db.execute(
             "SELECT model, active FROM model_registry ORDER BY id"
@@ -78,7 +79,12 @@ class TestVectorStore:
         assert expected.issubset(tables)
         store2.close()
 
-    # ── 2. chunk_text ────────────────────────────────────────────────────
+        # Reopening with a DIFFERENT dim is refused: the vec0 tables are
+        # fixed-dim, so a dim mismatch would silently break vector inserts.
+        with pytest.raises(VectorDimMismatchError):
+            VectorStore(db_path, model="model-c", dim=999)
+
+    # -- 2. chunk_text ----------------------------------------------------
 
     def test_chunk_text_short(self) -> None:
         assert chunk_text("short text") == ["short text"]
@@ -87,7 +93,7 @@ class TestVectorStore:
         assert chunk_text("") == []
 
     def test_chunk_text_overlap(self) -> None:
-        # 2x-size text; sliding window step = size - overlap → 3 windows.
+        # 2x-size text; sliding window step = size - overlap -> 3 windows.
         text = "A" * CHUNK_SIZE_CHARS + "B" * CHUNK_SIZE_CHARS
         chunks = chunk_text(text)
         assert len(chunks) == 3  # noqa: PLR2004
@@ -105,7 +111,7 @@ class TestVectorStore:
         for c in chunks:
             assert len(c) <= CHUNK_SIZE_CHARS
 
-    # ── 3. upsert_source_chunks + vector_search_chunks ───────────────────
+    # -- 3. upsert_source_chunks + vector_search_chunks -------------------
 
     def test_upsert_and_vector_search(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -120,7 +126,7 @@ class TestVectorStore:
         )
         assert len(rowids) == 2  # noqa: PLR2004
 
-        # Search with v1 → first rowid should be top
+        # Search with v1 -> first rowid should be top
         results = store.vector_search_chunks(v1, k=5)
         assert len(results) >= 1
         top_rowid, top_sim = results[0]
@@ -136,7 +142,7 @@ class TestVectorStore:
 
         store.close()
 
-    # ── 4. centroid ──────────────────────────────────────────────────────
+    # -- 4. centroid ------------------------------------------------------
 
     def test_centroid(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -161,14 +167,14 @@ class TestVectorStore:
         expected = np.mean([np.array(v_a), np.array(v_b)], axis=0).tolist()
         assert centroid == pytest.approx(expected, abs=1e-5)
 
-        # vector_search_topics with centroid → topic slug top
+        # vector_search_topics with centroid -> topic slug top
         results = store.vector_search_topics(centroid, k=5)
         assert results[0][0] == "t"
         assert results[0][1] == pytest.approx(1.0, abs=1e-5)
 
         store.close()
 
-    # ── 5. best_topic_for_vector ─────────────────────────────────────────
+    # -- 5. best_topic_for_vector -----------------------------------------
 
     def test_best_topic_for_vector(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -193,7 +199,7 @@ class TestVectorStore:
 
         store.close()
 
-    # ── 6. fts_search ────────────────────────────────────────────────────
+    # -- 6. fts_search ----------------------------------------------------
 
     def test_fts_search(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -210,7 +216,7 @@ class TestVectorStore:
 
         store.close()
 
-    # ── 7. tombstone_source ──────────────────────────────────────────────
+    # -- 7. tombstone_source ----------------------------------------------
 
     def test_tombstone_source(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -236,7 +242,7 @@ class TestVectorStore:
 
         store.close()
 
-    # ── 8. read_only ─────────────────────────────────────────────────────
+    # -- 8. read_only -----------------------------------------------------
 
     def test_read_only(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -290,7 +296,7 @@ class TestVectorStore:
         ro.close()
 
 
-# ── TestEmbedder ─────────────────────────────────────────────────────────────
+# -- TestEmbedder -------------------------------------------------------------
 
 
 class TestEmbedder:
@@ -312,17 +318,17 @@ class TestEmbedder:
         )
         embedder = Embedder(client, cfg)
 
-        # First call → hits the fake
+        # First call -> hits the fake
         vec1 = await embedder.embed_one("hello cache")
         assert vec1 == [float(i) for i in range(8)]
         assert call_count == 1
 
-        # Second call with same text → cache hit, fake not called
+        # Second call with same text -> cache hit, fake not called
         vec2 = await embedder.embed_one("hello cache")
         assert vec2 == [float(i) for i in range(8)]
         assert call_count == 1, "expected cache hit — fake should not be called"
 
-        # Different text → cache miss, fake called
+        # Different text -> cache miss, fake called
         vec3 = await embedder.embed_one("different text")
         assert vec3 == [float(i) for i in range(8)]
         assert call_count == 2  # noqa: PLR2004
@@ -357,7 +363,7 @@ class TestEmbedder:
         texts = ["aaaa", "bbbb", "aaaa"]  # third is duplicate
         results = await embedder.embed_texts(texts)
         assert len(results) == 3  # noqa: PLR2004
-        assert results[0] == results[2]  # same text → same vector
+        assert results[0] == results[2]  # same text -> same vector
         assert call_count == 2  # noqa: PLR2004 — only "aaaa" and "bbbb" hit API
 
     async def test_embed_query_alias(self, tmp_path: Path) -> None:

@@ -2,7 +2,7 @@
 
 The :class:`DebouncedIndex` regenerates ``INDEX.md`` (the brain's front door)
 with a configurable debounce delay.  Each call to :meth:`mark_dirty` resets
-the timer, so rapid ingestion batches produce a single flush 30 s after the
+the timer, so rapid ingestion batches produce a single flush 30 s after the
 last file settles.
 """
 
@@ -56,7 +56,7 @@ class DebouncedIndex:
             f"**{n_sources} sources · {n_topics} topics · last updated {now_str}**\n",
         ]
 
-        # ── Recent sources (up to 10, newest first) ──────────────────
+        # -- Recent sources (up to 10, newest first) ------------------
         if state.sources:
             lines.append("\n## Recent\n")
             sorted_sources = sorted(
@@ -67,12 +67,12 @@ class DebouncedIndex:
             for src in sorted_sources:
                 topic_info = ""
                 if src.topics:
-                    topic_info = f" [→ {src.topics[0]}]"
+                    topic_info = f" [-> {src.topics[0]}]"
                 lines.append(
-                    f"- {_date(src.ingested)} → {src.raw}{topic_info}\n"
+                    f"- {_date(src.ingested)} -> {src.raw}{topic_info}\n"
                 )
 
-        # ── Topics (alphabetical) ─────────────────────────────────────
+        # -- Topics (alphabetical) -------------------------------------
         if state.topics:
             lines.append("\n## Topics\n")
             sorted_items = sorted(
@@ -100,5 +100,5 @@ class DebouncedIndex:
 
 
 def _date(iso: str) -> str:
-    """Extract ``YYYY-MM-DD`` from an ISO 8601 string."""
+    """Extract ``YYYY-MM-DD`` from an ISO 8601 string."""
     return iso[:10]

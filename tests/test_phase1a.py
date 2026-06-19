@@ -25,7 +25,7 @@ from second_brain.models import (
 )
 from second_brain.state import BrainStateStore, now_iso
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# -- helpers ------------------------------------------------------------------
 
 
 class _FakeCfg:
@@ -35,7 +35,7 @@ class _FakeCfg:
         self.brain_root = brain_root
 
 
-# ── front-matter ─────────────────────────────────────────────────────────────
+# -- front-matter -------------------------------------------------------------
 
 
 class TestFrontmatter:
@@ -85,7 +85,7 @@ class TestFrontmatter:
         assert result.endswith("\n")
 
 
-# ── state store ──────────────────────────────────────────────────────────────
+# -- state store --------------------------------------------------------------
 
 
 class TestBrainStateStoreLoad:
@@ -110,7 +110,7 @@ class TestBrainStateStoreLoad:
 
 
 class TestBackupRecovery:
-    """Recovery chain: corrupt primary → falls back to .bak."""
+    """Recovery chain: corrupt primary -> falls back to .bak."""
 
     def test_recover_from_bak(self, tmp_path: Path) -> None:
         cfg = _FakeCfg(tmp_path)
@@ -127,7 +127,7 @@ class TestBackupRecovery:
         assert store2.state.topics["survivor"].title == "Survivor Topic"
 
     def test_recover_from_bak_1(self, tmp_path: Path) -> None:
-        """Fall through primary .bak → .bak-1."""
+        """Fall through primary .bak -> .bak-1."""
         cfg = _FakeCfg(tmp_path)
         store = BrainStateStore(cfg)
 
@@ -173,7 +173,7 @@ class TestBackupRecovery:
 
 
 class TestAllFailFresh:
-    """When primary + all backups are corrupt → fresh empty state."""
+    """When primary + all backups are corrupt -> fresh empty state."""
 
     def test_all_corrupt_returns_fresh(self, tmp_path: Path) -> None:
         cfg = _FakeCfg(tmp_path)

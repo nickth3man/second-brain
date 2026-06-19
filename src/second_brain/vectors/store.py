@@ -8,7 +8,7 @@ Schema
 - **source_chunks_fts**: ``fts5`` virtual table for keyword search (hybrid).
 - **topic_centroids_vec**: ``vec0`` virtual table for topic centroids.
 - **topic_centroids_meta**: centroid metadata (slug, rowid, member count).
-- **topic_members**: many-to-many mapping source → topic.
+- **topic_members**: many-to-many mapping source -> topic.
 - **vec_tombstones**: deletion audit log.
 
 All write operations are exclusive to the daemon process.  Read-only
@@ -37,7 +37,7 @@ CHUNK_SIZE_CHARS = 3200
 CHUNK_OVERLAP_CHARS = 400
 
 
-# ── chunking ─────────────────────────────────────────────────────────────────
+# -- chunking -----------------------------------------------------------------
 
 
 def chunk_text(
@@ -79,7 +79,7 @@ def chunk_text(
     return chunks
 
 
-# ── binary packing ───────────────────────────────────────────────────────────
+# -- binary packing -----------------------------------------------------------
 
 
 def _pack(vec: list[float], dim: int) -> bytes:
@@ -92,7 +92,16 @@ def _unpack(blob: bytes, dim: int) -> list[float]:
     return list(struct.unpack(f"{dim}f", blob))
 
 
-# ── VectorStore ──────────────────────────────────────────────────────────────
+# -- VectorStore --------------------------------------------------------------
+
+
+class VectorDimMismatchError(Exception):
+    """Raised when an existing embeddings.db was built with a different dim.
+
+    Swapping embedding models changes the vector dimension and the vec0 schema is
+    fixed at creation. Resolve by deleting ``.brain/embeddings.db`` (and
+    re-running ingest) or via a blue/green embedding swap (§12.6).
+    """
 
 
 class VectorStore:
@@ -130,6 +139,24 @@ class VectorStore:
             self.db = sqlite3.connect(str(db_path))
             self.db.enable_load_extension(True)
             self.db.load_extension(sqlite_vec.loadable_path())
+            self.db.row_factory = sqlite3.Row
+            # Detect a dim mismatch with an existing db before mutating schema.
+            has_reg = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='model_registry'"
+            ).fetchone()
+            if has_reg:
+                prior = self.db.execute(
+                    "SELECT dim FROM model_registry WHERE active=1 "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if prior is not None and prior["dim"] != dim:
+                    self.db.close()
+                    raise VectorDimMismatchError(
+                        f"embeddings.db stored dim={prior['dim']} but model "
+                        f"{model!r} probes dim={dim}; delete .brain/embeddings.db "
+                        f"or run a blue/green swap (§12.6)"
+                    )
             self._init_schema()
             self._register_model(model, dim)
 
@@ -142,7 +169,7 @@ class VectorStore:
             read_only=read_only,
         )
 
-    # ── schema ───────────────────────────────────────────────────────────
+    # -- schema -----------------------------------------------------------
 
     def _init_schema(self) -> None:
         """Idempotently create all tables and virtual tables.
@@ -214,7 +241,7 @@ class VectorStore:
         )
         self.db.commit()
 
-    # ── model registry queries ───────────────────────────────────────────
+    # -- model registry queries -------------------------------------------
 
     def active_dim(self) -> int:
         """Return the dimension of the currently active embedding model."""
@@ -224,7 +251,7 @@ class VectorStore:
         ).fetchone()
         return row["dim"] if row else self.dim
 
-    # ── chunk write ──────────────────────────────────────────────────────
+    # -- chunk write ------------------------------------------------------
 
     def upsert_source_chunks(
         self,
@@ -268,7 +295,7 @@ class VectorStore:
             raise
         return rowids
 
-    # ── topic membership ─────────────────────────────────────────────────
+    # -- topic membership -------------------------------------------------
 
     def add_topic_member(self, topic_slug: str, source_id: str) -> bool:
         """Register *source_id* as a member of the topic.
@@ -292,7 +319,7 @@ class VectorStore:
         ).fetchall()
         return [r["source_id"] for r in rows]
 
-    # ── centroids ────────────────────────────────────────────────────────
+    # -- centroids --------------------------------------------------------
 
     def recompute_centroid(self, topic_slug: str) -> list[float] | None:
         """Recompute the centroid vector for *topic_slug* from member chunks.
@@ -373,7 +400,7 @@ class VectorStore:
             self.db.rollback()
             raise
 
-    # ── chunk topic assignment ───────────────────────────────────────────
+    # -- chunk topic assignment -------------------------------------------
 
     def set_chunk_topic(self, source_id: str, topic_slug: str) -> None:
         """Set the topic for all chunks of a given source."""
@@ -387,7 +414,7 @@ class VectorStore:
         )
         self.db.commit()
 
-    # ── deletion / tombstoning ───────────────────────────────────────────
+    # -- deletion / tombstoning -------------------------------------------
 
     def tombstone_source(self, source_id: str) -> None:
         """Remove all chunks for *source_id* and record tombstones.
@@ -425,7 +452,7 @@ class VectorStore:
             self.db.rollback()
             raise
 
-    # ── vector search ────────────────────────────────────────────────────
+    # -- vector search ----------------------------------------------------
 
     def vector_search_chunks(
         self,
@@ -477,7 +504,7 @@ class VectorStore:
         results = self.vector_search_topics(vec, k=1)
         return results[0] if results else None
 
-    # ── FTS / keyword search ─────────────────────────────────────────────
+    # -- FTS / keyword search ---------------------------------------------
 
     def fts_search(
         self,
@@ -498,7 +525,7 @@ class VectorStore:
         ).fetchall()
         return [(r["rowid"], r["score"]) for r in rows]
 
-    # ── chunk metadata queries ───────────────────────────────────────────
+    # -- chunk metadata queries -------------------------------------------
 
     def get_chunk(self, rowid: int) -> dict[str, Any] | None:
         """Return the metadata row for a chunk, or ``None``."""
@@ -516,7 +543,7 @@ class VectorStore:
         ).fetchone()
         return row["cnt"]
 
-    # ── lifecycle ────────────────────────────────────────────────────────
+    # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""

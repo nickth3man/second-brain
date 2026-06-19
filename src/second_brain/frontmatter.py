@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import yaml
 
-# ── public helpers ───────────────────────────────────────────────────────────
+# -- public helpers -----------------------------------------------------------
 
 
 def split_frontmatter(text: str) -> tuple[dict, str]:
@@ -47,7 +47,7 @@ def split_frontmatter(text: str) -> tuple[dict, str]:
                 raise ValueError(f"Malformed YAML front-matter: {exc}") from exc
             return dict(meta), body
 
-    # Opening "---" with no closing delimiter → not valid front-matter.
+    # Opening "---" with no closing delimiter -> not valid front-matter.
     return {}, text
 
 

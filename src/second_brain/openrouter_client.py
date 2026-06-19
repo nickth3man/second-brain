@@ -1,7 +1,7 @@
 """OpenRouter HTTP client with ZDR privacy and keyring resolution (§12.7).
 
 Provides an async httpx client that enforces ``provider.zdr: true`` on every
-request, resolves the API key via keyring → env → config, and raises typed
+request, resolves the API key via keyring -> env -> config, and raises typed
 exceptions for HTTP 402 (credit exhaustion, §12.3).
 """
 
@@ -15,7 +15,7 @@ import keyring
 
 from second_brain.config import Config
 
-# ── exceptions ──────────────────────────────────────────────────────────────
+# -- exceptions --------------------------------------------------------------
 
 
 class OpenRouterError(Exception):
@@ -26,7 +26,7 @@ class CreditExhaustedError(OpenRouterError):
     """Raised on HTTP 402 — credit exhaustion stops the daemon (§12.3)."""
 
 
-# ── key resolution ──────────────────────────────────────────────────────────
+# -- key resolution ----------------------------------------------------------
 
 
 def resolve_api_key(cfg: Config) -> str:
@@ -70,7 +70,7 @@ def resolve_api_key(cfg: Config) -> str:
     )
 
 
-# ── client ──────────────────────────────────────────────────────────────────
+# -- client ------------------------------------------------------------------
 
 
 class OpenRouterClient:
@@ -110,7 +110,7 @@ class OpenRouterClient:
     async def __aexit__(self, *args: object) -> None:
         await self.close()
 
-    # ── provider params ─────────────────────────────────────────────────
+    # -- provider params -------------------------------------------------
 
     def _zdr_provider(self) -> dict[str, Any]:
         """Build the ``provider`` sub-dict enforcing ZDR (§12.7).
@@ -126,7 +126,7 @@ class OpenRouterClient:
             params["data_collection"] = "deny"
         return params
 
-    # ── API methods ─────────────────────────────────────────────────────
+    # -- API methods -----------------------------------------------------
 
     async def chat_completion(
         self,

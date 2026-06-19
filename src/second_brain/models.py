@@ -13,7 +13,7 @@ from enum import StrEnum, auto
 
 from pydantic import BaseModel, ConfigDict
 
-# ── StrEnum helpers ──────────────────────────────────────────────────────────
+# -- StrEnum helpers ----------------------------------------------------------
 
 
 class IngestStage(StrEnum):
@@ -50,7 +50,7 @@ class PageType(StrEnum):
     NOTE = auto()
 
 
-# ── Front-matter / ingestion schemas ────────────────────────────────────────
+# -- Front-matter / ingestion schemas ----------------------------------------
 
 
 class SourceMeta(BaseModel):
@@ -99,7 +99,7 @@ class LibrarianOutput(BaseModel):
     topics: list[LinkDecision]
 
 
-# ── State persistence schemas (§4.4) ────────────────────────────────────────
+# -- State persistence schemas (§4.4) ----------------------------------------
 
 
 class TopicState(BaseModel):

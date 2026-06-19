@@ -3,7 +3,7 @@
 Defines the system prompt, message builder, strict-JSON-schema wrapper, and
 the extract function with a single repair fallback.
 
-Phase 1 does **not** implement map-reduce or RAPTOR — one stuffed call + one
+Phase 1 does **not** implement map-reduce or RAPTOR — one stuffed call + one
 repair call is the slice.
 """
 
@@ -18,7 +18,7 @@ from second_brain.daemon.normalize import estimate_tokens
 from second_brain.models import LibrarianOutput
 from second_brain.openrouter_client import CreditExhaustedError
 
-# ── prompt ────────────────────────────────────────────────────────────────────
+# -- prompt --------------------------------------------------------------------
 
 LIBRARIAN_SYSTEM_PROMPT = """\
 You are the librarian for a personal second brain.
@@ -28,7 +28,7 @@ INPUT:
 - Existing topic titles for context.
 
 JOB:
-1. Summarize the source in ≤2 sentences.
+1. Summarize the source in <=2 sentences.
 2. Propose 3–7 topics this source belongs to.
 3. For each topic: output its name, confidence (0.0–1.0), and a markdown
    section to merge into that topic's Synthesis.
@@ -41,14 +41,14 @@ CONSTRAINTS:
 - If unsure about a link, confidence < 0.6.
 """
 
-# ── exceptions ────────────────────────────────────────────────────────────────
+# -- exceptions ----------------------------------------------------------------
 
 
 class ExtractionError(Exception):
     """Extraction failed after all retry/fallback attempts."""
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers -------------------------------------------------------------------
 
 
 def build_messages(
@@ -57,8 +57,8 @@ def build_messages(
 ) -> list[dict]:
     """Build the messages list for the librarian chat completion.
 
-    Truncates *source_body* if its estimated token count exceeds 16 000
-    (§12.2: map-reduce deferred in Phase 1).
+    Truncates *source_body* if its estimated token count exceeds 16 000
+    (§12.2: map-reduce deferred in Phase 1).
     """
     if estimate_tokens(source_body) > 16000:
         source_body = (
@@ -96,7 +96,7 @@ def schema_for_strict() -> dict:
     }
 
 
-# ── main entry point ──────────────────────────────────────────────────────────
+# -- main entry point ----------------------------------------------------------
 
 
 async def extract(
@@ -135,7 +135,7 @@ async def extract(
         content = resp["choices"][0]["message"]["content"]
         return LibrarianOutput.model_validate_json(content)
 
-    # ── Primary attempt ────────────────────────────────────────────────
+    # -- Primary attempt ------------------------------------------------
     try:
         return await _try(model)
     except CreditExhaustedError:
@@ -143,11 +143,11 @@ async def extract(
     except httpx.HTTPStatusError as e:
         if e.response.status_code < 500:  # 4xx (402 already caught above)
             raise  # immediate abort, no fallback
-        # 5xx → fall through to repair
+        # 5xx -> fall through to repair
     except (json.JSONDecodeError, ValidationError):
-        pass  # Parse error → fallback
+        pass  # Parse error -> fallback
 
-    # ── Repair fallback ─────────────────────────────────────────────────
+    # -- Repair fallback -------------------------------------------------
     try:
         return await _try(repair_model)
     except CreditExhaustedError:

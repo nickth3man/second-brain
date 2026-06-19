@@ -42,8 +42,25 @@ class Embedder:
     def __init__(self, client, cfg) -> None:
         self.client = client
         self.model = cfg.models.embedding
-        self.dim = DEFAULT_EMBED_DIM
+        self.dim = DEFAULT_EMBED_DIM  # fallback; real dim learned via ensure_dim()
+        self._dim_probed = False
         self.cfg = cfg
+
+    async def ensure_dim(self) -> int:
+        """Probe the model once to learn its real vector dimension.
+
+        Different embedding models have different dims (text-embedding-3-small =
+        1536, qwen3-embedding-8b = 4096, ...). Hardcoding 1536 breaks struct
+        packing when the user swaps models, so we probe by embedding a short
+        string and reading ``len(vector)``. Cached on the instance. Call this
+        BEFORE constructing a ``VectorStore`` so the vec0 schema matches the model.
+        """
+        if self._dim_probed:
+            return self.dim
+        vec = await self.embed_one("dimension probe")
+        self.dim = len(vec)
+        self._dim_probed = True
+        return self.dim
 
     async def embed_one(self, text: str) -> list[float]:
         """Embed a single text string, using on-disk cache when available.
@@ -56,6 +73,9 @@ class Embedder:
             return json.loads(cache_path.read_text(encoding="utf-8"))
 
         vec = await self.client.embedding(self.model, text)
+        if not self._dim_probed:
+            self.dim = len(vec)
+            self._dim_probed = True
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(cache_path, json.dumps(vec))
         return vec

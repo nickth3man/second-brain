@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-# ── section models ──────────────────────────────────────────────────────────
+# -- section models ----------------------------------------------------------
 
 
 class OpenRouterCfg(BaseModel):
@@ -83,7 +83,7 @@ class GitCfg(BaseModel):
     commit_on_compaction: bool
 
 
-# ── top-level config ────────────────────────────────────────────────────────
+# -- top-level config --------------------------------------------------------
 
 
 class Config(BaseModel):
@@ -102,7 +102,7 @@ class Config(BaseModel):
     brain_root: Path
 
 
-# ── helpers ─────────────────────────────────────────────────────────────────
+# -- helpers -----------------------------------------------------------------
 
 
 def _find_config_toml(start: Path | None = None) -> Path:

@@ -1,6 +1,6 @@
 """Source normalization — write 50-sources/*.md with front-matter (§4.1, §5 [2]).
 
-Handles text/code/structured stages only in Phase 1. Multimodal stages
+Handles text/code/structured stages only in Phase 1. Multimodal stages
 (PDF, vision, office, audio, video) raise ``ValueError``.
 """
 
@@ -34,7 +34,7 @@ def source_id_for(path: Path, body: str, ingested_iso: str) -> str:
 
 
 def sha256_of_file(path: Path) -> str:
-    """Streaming SHA‑256 digest of *path* (1 MiB chunks)."""
+    """Streaming SHA-256 digest of *path* (1 MiB chunks)."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
@@ -62,7 +62,7 @@ async def normalize_text(
 
     Raises:
         ValueError: if *stage* is not one of ``text``, ``code``, or
-            ``structured`` (unsupported in Phase 1).
+            ``structured`` (unsupported in Phase 1).
     """
     supported = {"text", "code", "structured"}
     if stage not in supported:
