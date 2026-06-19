@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Second Brain{% endblock %}</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/health">Health</a>
+    <form action="/search" method="get" role="search">
+      <input name="q" type="search" placeholder="Search the brain…" aria-label="Search">
+    </form>
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

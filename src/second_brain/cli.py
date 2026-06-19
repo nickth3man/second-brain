@@ -258,6 +258,21 @@ def health() -> None:
 
 
 @app.command()
+def serve(
+    port: Annotated[
+        int, typer.Option("--port", "-p", help="Port to bind (127.0.0.1 only).")
+    ] = 8000,
+) -> None:
+    """Start the web UI server (Phase 5B).  Bound to 127.0.0.1 only."""
+    from second_brain.web.app import run_server
+
+    typer.echo(
+        f"Serving the brain at http://127.0.0.1:{port} (Ctrl-C to stop)."
+    )
+    run_server(port=port)
+
+
+@app.command()
 def ask() -> None:
     """Ask a question via the chat interface (Phase 6)."""
     typer.echo("Not yet implemented (Phase 6).")

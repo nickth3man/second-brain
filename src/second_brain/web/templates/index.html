@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Second Brain — Home{% endblock %}
+{% block content %}
+<h1>Second Brain</h1>
+
+<p class="totals">{{ source_count }} sources, {{ topic_count }} topics</p>
+
+{% if recent_sources %}
+<section>
+  <h2>Recent</h2>
+  <ul>
+    {% for src in recent_sources %}
+    <li>
+      {% if src.topic_slug and src.topic_title %}
+      <a href="/topic/{{ src.topic_slug }}">{{ src.topic_title }}</a>
+      {% else %}
+      {{ src.source_id }}
+      {% endif %}
+      <small>({{ src.ingested }})</small>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if topics %}
+<section>
+  <h2>Topics</h2>
+  <ul class="topic-list">
+    {% for t in topics %}
+    <li>
+      <a href="/topic/{{ t.slug }}">{{ t.title }}</a>
+      — {{ t.source_count }} sources
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock %}

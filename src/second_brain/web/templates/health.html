@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Health — Second Brain{% endblock %}
+{% block content %}
+<h1>Brain Health</h1>
+
+<table class="health-table">
+  <tr><th>Sources</th><td>{{ report.source_count }}</td></tr>
+  <tr><th>Topics</th><td>{{ report.topic_count }}</td></tr>
+  <tr><th>Orphan sources</th><td>{{ report.orphans.sources|length }}</td></tr>
+  <tr><th>Orphan topics</th><td>{{ report.orphans.topics|length }}</td></tr>
+  <tr><th>Broken links</th><td>{{ report.broken_links|length }}</td></tr>
+  <tr><th>Empty extractions</th><td>{{ report.empty_extractions|length }}</td></tr>
+  <tr><th>Stale topics (>90d)</th><td>{{ report.stale_topics|length }}</td></tr>
+  <tr><th>Avg confidence</th><td>{{ "%.3f"|format(report.avg_confidence) }}</td></tr>
+  <tr><th>Schema violations</th><td>{{ report.schema_violations|length }}</td></tr>
+</table>
+
+{% if report.orphans.sources %}
+<section>
+  <h2>Orphan sources</h2>
+  <ul>
+    {% for sid in report.orphans.sources %}
+    <li>{{ sid }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if report.orphans.topics %}
+<section>
+  <h2>Orphan topics</h2>
+  <ul>
+    {% for slug in report.orphans.topics %}
+    <li>{{ slug }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if report.broken_links %}
+<section>
+  <h2>Broken links</h2>
+  <ul>
+    {% for from_slug, to_slug in report.broken_links %}
+    <li><a href="/topic/{{ from_slug }}">{{ from_slug }}</a> → {{ to_slug }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if report.stale_topics %}
+<section>
+  <h2>Stale topics</h2>
+  <ul>
+    {% for slug in report.stale_topics %}
+    <li>{{ slug }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{{ health_md | safe }}
+{% endblock %}

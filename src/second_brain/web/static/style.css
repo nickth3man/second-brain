@@ -1,0 +1,103 @@
+/* Second Brain — minimal readable stylesheet */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.7;
+  color: #1a1a1a;
+  background: #fafafa;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #ddd;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+nav a { color: #2563eb; text-decoration: none; font-weight: 500; }
+nav a:hover { text-decoration: underline; }
+nav form { margin-left: auto; }
+nav input { padding: 0.3rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; }
+
+h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+h2 { font-size: 1.3rem; margin-top: 1.5rem; margin-bottom: 0.5rem; }
+h3 { font-size: 1.1rem; margin-top: 1rem; margin-bottom: 0.3rem; }
+p, li { margin-bottom: 0.5rem; }
+ul, ol { padding-left: 1.5rem; }
+a { color: #2563eb; }
+a:hover { text-decoration: underline; }
+
+/* breadcrumbs */
+.breadcrumbs { font-size: 0.85rem; margin-bottom: 1rem; color: #666; }
+.breadcrumbs a { color: #2563eb; text-decoration: none; }
+.breadcrumbs a:hover { text-decoration: underline; }
+
+/* totals */
+.totals { font-size: 0.95rem; color: #555; margin-bottom: 1rem; }
+
+/* infobox */
+.infobox {
+  float: right;
+  margin: 0 0 1rem 1.5rem;
+  padding: 0.75rem;
+  background: #f0f4ff;
+  border: 1px solid #c8d8f0;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  max-width: 280px;
+}
+.infobox table { width: 100%; border-collapse: collapse; }
+.infobox th, .infobox td { padding: 0.25rem 0.5rem; text-align: left; vertical-align: top; }
+.infobox th { font-weight: 600; white-space: nowrap; color: #333; width: 40%; }
+.infobox td { color: #444; }
+
+/* wikilink states */
+.wikilink { color: #2563eb; text-decoration: none; }
+.wikilink:hover { text-decoration: underline; }
+.wikilink--self { color: #555; font-weight: 600; cursor: default; }
+.wikilink--missing { color: #b91c1c; text-decoration-style: dotted; text-decoration-line: underline; }
+
+/* external links */
+.extlink::after { content: " ↗"; font-size: 0.8em; }
+
+/* code */
+code { background: #eee; padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.88em; }
+pre { background: #f4f4f4; padding: 0.75rem; border-radius: 4px; overflow-x: auto; font-size: 0.88em; border: 1px solid #e0e0e0; }
+pre code { background: none; padding: 0; }
+
+/* tables */
+table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; }
+th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; }
+th { background: #f4f4f4; font-weight: 600; }
+
+/* search */
+.search-form { margin-bottom: 1rem; }
+.search-form input { padding: 0.4rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; font-size: 1rem; width: 250px; }
+.search-form button { padding: 0.4rem 0.8rem; border: 1px solid #2563eb; background: #2563eb; color: #fff; border-radius: 4px; cursor: pointer; }
+.search-form button:hover { background: #1d4ed8; }
+.fallback-note { color: #b45309; font-style: italic; margin-bottom: 0.5rem; }
+.result-count { margin-bottom: 0.5rem; color: #555; }
+.search-results { list-style: none; padding: 0; }
+.search-hit { padding: 0.5rem 0; border-bottom: 1px solid #eee; }
+.hit-score { font-size: 0.8rem; color: #777; margin-right: 0.5rem; }
+.hit-topic { font-weight: 600; }
+.hit-source { font-size: 0.85rem; color: #888; margin-left: 0.5rem; }
+.hit-snippet { margin-top: 0.2rem; font-size: 0.9rem; color: #333; }
+
+/* health page */
+.health-table { width: auto; min-width: 300px; }
+.health-table th { width: 200px; }
+
+/* responsive */
+@media (max-width: 640px) {
+  body { padding: 0.75rem; }
+  nav { flex-direction: column; align-items: stretch; }
+  nav form { margin-left: 0; }
+  .infobox { float: none; margin: 1rem 0; max-width: 100%; }
+}

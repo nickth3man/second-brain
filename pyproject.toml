@@ -22,6 +22,11 @@ dependencies = [
     "pymupdf",
     "mammoth",
     "readability-lxml",
+    "mistune>=3",
+    "jinja2>=3",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
 ]
 
 [project.optional-dependencies]
