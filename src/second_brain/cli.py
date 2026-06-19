@@ -11,6 +11,10 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+from typing import Annotated
+
 import typer
 
 from second_brain import __version__
@@ -66,8 +70,45 @@ def init() -> None:
 
 @app.command()
 def watch() -> None:
-    """Start the file-watcher daemon (Phase 1)."""
-    typer.echo("Daemon not yet implemented (Phase 1).")
+    """Start the file-watcher daemon (Phase 1 — text-only ingestion loop)."""
+    from second_brain.daemon.pipeline import run_daemon
+
+    cfg = load_config()
+    typer.echo(f"Watching {cfg.brain_root / '00-inbox'}/ ... Ctrl-C to stop.")
+    asyncio.run(run_daemon(cfg))
+
+
+@app.command()
+def ingest(
+    path: Annotated[
+        Path, typer.Argument(help="Path to the file to ingest (one-shot, for testing).")
+    ],
+) -> None:
+    """Ingest a single file (one-shot, without the watcher)."""
+
+    async def _ingest_one() -> str:
+        from second_brain.daemon.index import DebouncedIndex
+        from second_brain.daemon.linker import SlugLinker
+        from second_brain.daemon.pipeline import ingest_file
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.state import BrainStateStore
+
+        cfg = load_config()
+        client = OpenRouterClient(cfg)
+        store = BrainStateStore.load(cfg)
+        linker = SlugLinker()
+        index = DebouncedIndex(cfg, store)
+        try:
+            stage = await ingest_file(
+                path, cfg, store, client, linker, index
+            )
+            await index.flush_now()
+            return str(stage)
+        finally:
+            await client.close()
+
+    stage = asyncio.run(_ingest_one())
+    typer.echo(f"{path.name}: {stage}")
 
 
 @app.command()
