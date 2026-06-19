@@ -19,6 +19,8 @@ dependencies = [
     "tenacity",
     "sqlite-vec",
     "numpy",
+    "mammoth",
+    "readability-lxml",
 ]
 
 [project.optional-dependencies]

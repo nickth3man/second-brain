@@ -3,11 +3,16 @@
 Provides an async httpx client that enforces ``provider.zdr: true`` on every
 request, resolves the API key via keyring -> env -> config, and raises typed
 exceptions for HTTP 402 (credit exhaustion, §12.3).
+
+Vision (``vision_describe``) and STT (``transcribe``) methods added in
+Phase 3 Wave 1 per §6 and §12.7.
 """
 
 from __future__ import annotations
 
+import base64
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -127,6 +132,98 @@ class OpenRouterClient:
         return params
 
     # -- API methods -----------------------------------------------------
+
+    async def vision_describe(
+        self,
+        model: str,
+        images: list[bytes],
+        prompt: str,
+        *,
+        mime: str = "image/png",
+    ) -> str:
+        """Describe one or more images via a vision-capable model.
+
+        Builds a single user message whose ``content`` is a list of alternating
+        text and image-url parts.  The caller MUST keep ``len(images)`` within
+        ``cfg.ingestion.vision_max_images_per_request`` (PDF rendering sends one
+        page per request per §6).
+
+        Args:
+            model: OpenRouter vision model slug.
+            images: Raw image bytes (one per page/screenshot).
+            prompt: Text prompt accompanying the images.
+            mime: MIME type of the images (default ``image/png``).
+
+        Returns:
+            The model's text response.
+
+        Raises:
+            CreditExhaustedError: on HTTP 402.
+            httpx.HTTPStatusError: on other HTTP errors.
+        """
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for im in images:
+            b64 = base64.b64encode(im).decode()
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                }
+            )
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "provider": self._zdr_provider(),
+        }
+        resp = await self.client.post("/chat/completions", json=body)
+        if resp.status_code == 402:
+            raise CreditExhaustedError(
+                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
+            )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    async def transcribe(
+        self,
+        model: str,
+        audio_path: Path,
+        *,
+        language: str | None = None,
+    ) -> str:
+        """Transcribe an audio file via OpenRouter's /audio/transcriptions.
+
+        Sends the file as **multipart/form-data** (not JSON).  ZDR is conveyed
+        through the default HTTP-Referer / X-Title headers (the existing client
+        headers); no ``provider`` field is sent in the multipart body.
+
+        Args:
+            model: OpenRouter STT model slug.
+            audio_path: Path to the audio file on disk.
+            language: Optional ISO language code hint.
+
+        Returns:
+            The transcribed text.
+
+        Raises:
+            CreditExhaustedError: on HTTP 402.
+            httpx.HTTPStatusError: on other HTTP errors.
+        """
+        data: dict[str, Any] = {"model": model}
+        if language is not None:
+            data["language"] = language
+
+        with open(audio_path, "rb") as f:
+            resp = await self.client.post(
+                "/audio/transcriptions",
+                files={"file": (audio_path.name, f, "audio/mpeg")},
+                data=data,
+            )
+        if resp.status_code == 402:
+            raise CreditExhaustedError(
+                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
+            )
+        resp.raise_for_status()
+        return resp.json()["text"]
 
     async def chat_completion(
         self,

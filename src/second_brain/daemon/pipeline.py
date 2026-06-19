@@ -110,7 +110,7 @@ async def ingest_file(
         # -- Stage 2: Normalise ---------------------------------------
         try:
             await normalize_text(
-                path, source_id, sha, ingested, stage, cfg
+                path, source_id, sha, ingested, stage, cfg, client
             )
         except ValueError as e:
             store.transition(source_id, IngestStage.FAILED, error=str(e))

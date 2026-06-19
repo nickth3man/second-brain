@@ -1,7 +1,8 @@
 """Source normalization — write 50-sources/*.md with front-matter (§4.1, §5 [2]).
 
-Handles text/code/structured stages only in Phase 1. Multimodal stages
-(PDF, vision, office, audio, video) raise ``ValueError``.
+Dispatches parsing via :func:`parse_to_markdown` based on the pipeline stage.
+Phase 3 Wave 1 handles text, code, structured, office, web, and ebook stages.
+Wave 2 adds pdf, vision, audio, and video.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from second_brain.atomicio import write_atomic
 from second_brain.config import Config
 from second_brain.frontmatter import dump_frontmatter
 from second_brain.models import SourceMeta
+from second_brain.openrouter_client import OpenRouterClient
 from second_brain.slug import slugify
 
 
@@ -54,21 +56,28 @@ async def normalize_text(
     ingested_iso: str,
     stage: str,
     cfg: Config,
+    client: OpenRouterClient,
 ) -> Path:
     """Normalise a raw inbox file into a ``50-sources/<source_id>.md`` file.
 
     The output file has YAML front-matter (:class:`SourceMeta`) followed by
-    the raw body and an empty ``## Summary`` section.
+    the parsed body and an empty ``## Summary`` section.
+
+    Parsing is dispatched to the appropriate parser via
+    :func:`parse_to_markdown` based on *stage*.
+
+    Args:
+        client: OpenRouter client (needed for Wave-2 vision/STT parsers;
+            Wave-1 parsers ignore it).
 
     Raises:
-        ValueError: if *stage* is not one of ``text``, ``code``, or
-            ``structured`` (unsupported in Phase 1).
+        NotImplementedError: if *stage* is a Wave-2 stage (pdf, vision, audio,
+            video).
+        ValueError: if *stage* is unknown.
     """
-    supported = {"text", "code", "structured"}
-    if stage not in supported:
-        raise ValueError(f"unsupported in Phase 1: {stage}")
+    from second_brain.parse import parse_to_markdown
 
-    body = path.read_text(encoding="utf-8", errors="replace")
+    body = await parse_to_markdown(path, stage, cfg, client)
 
     try:
         rel = path.resolve().relative_to(cfg.brain_root.resolve()).as_posix()
