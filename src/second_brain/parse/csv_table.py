@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -115,16 +116,29 @@ def summarize_csv(
         return f"# {path.stem}\n\n_Empty file._\n"
 
     n_cols = len(header)
-    rows: list[list[str]] = []
+    # Reservoir sampling (seeded -> deterministic) so the sample represents
+    # the WHOLE file, not just the first N rows. Without this, a
+    # heterogeneous file (e.g. a multi-file data dictionary) yields a sample
+    # from only its first section, biasing the topic title toward it.
+    rng = random.Random(20250620)
+    sampled: list[tuple[int, list[str]]] = []  # (row index, row)
     row_count = 0
 
     for row in reader:
         # Skip empty rows
         if not row or all(c.strip() == "" for c in row):
             continue
+        i = row_count
         row_count += 1
-        if len(rows) < max_sample_rows:
-            rows.append(row)
+        if len(sampled) < max_sample_rows:
+            sampled.append((i, row))
+        else:
+            j = rng.randint(0, i)
+            if j < max_sample_rows:
+                sampled[j] = (i, row)
+
+    sampled.sort(key=lambda t: t[0])
+    rows = [r for _, r in sampled]
 
     # Cap display for huge files
     row_display = f"{DISPLAY_CAP:,}+" if row_count > DISPLAY_CAP else f"{row_count:,}"

@@ -107,6 +107,20 @@ class TestSummarizeCsv:
         result = summarize_csv(csv_file)
         assert "100,000+" in result
 
+    def test_sample_is_representative(self, tmp_path: Path) -> None:
+        """Reservoir sampling spreads the sample across the whole file, not
+        just the first N rows — prevents narrow titles on heterogeneous files
+        (e.g. a multi-file data dictionary fixating on its first section)."""
+        csv_file = tmp_path / "hetero.csv"
+        rows = ["section,value"]
+        for sec in ("SEC_A", "SEC_B", "SEC_C"):
+            rows += [f"{sec},{i}" for i in range(20)]
+        csv_file.write_text("\n".join(rows) + "\n")
+        result = summarize_csv(csv_file)
+        sample = result.split("### Sample rows", 1)[1]
+        found = {s for s in ("SEC_A", "SEC_B", "SEC_C") if s in sample}
+        assert len(found) >= 2, f"reservoir sample not representative: only {found}"
+
     def test_long_cell_truncation(self, tmp_path: Path) -> None:
         """Cells longer than max_cell_chars are truncated."""
         csv_file = tmp_path / "long.csv"
