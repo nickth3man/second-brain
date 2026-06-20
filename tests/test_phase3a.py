@@ -354,7 +354,7 @@ class TestNormalize:
         # Ensure 50-sources/ exists
         (cfg.brain_root / "50-sources").mkdir(parents=True, exist_ok=True)
 
-        dst = await normalize_text(p, source_id, sha, ingested, "web", cfg, client)
+        dst, body = await normalize_text(p, source_id, sha, ingested, "web", cfg, client)
 
         assert dst.exists()
         assert dst.parent.name == "50-sources"
@@ -387,7 +387,7 @@ class TestNormalize:
 
         (cfg.brain_root / "50-sources").mkdir(parents=True, exist_ok=True)
 
-        dst = await normalize_text(p, source_id, sha, ingested, "text", cfg, client)
+        dst, body = await normalize_text(p, source_id, sha, ingested, "text", cfg, client)
         content = dst.read_text(encoding="utf-8")
         meta, body = split_frontmatter(content)
 

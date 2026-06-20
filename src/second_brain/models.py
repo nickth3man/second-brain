@@ -133,6 +133,7 @@ class SourceState(BaseModel):
     type: str = "text"
     ingested: str = ""
     error: str | None = None
+    partial: bool = False
 
 
 class BrainState(BaseModel):

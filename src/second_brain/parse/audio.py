@@ -19,11 +19,23 @@ from pathlib import Path
 import structlog
 
 from second_brain.config import Config
-from second_brain.openrouter_client import OpenRouterClient
+from second_brain.openrouter_client import (
+    CreditExhaustedError,
+    OpenRouterAPIError,
+    OpenRouterClient,
+)
 
 logger = structlog.get_logger(__name__)
 
-CHUNK_MINUTES = 15
+CHUNK_MINUTES = 4
+MAX_CHUNK_BYTES = 8_000_000
+
+
+# -- exceptions --------------------------------------------------------------
+
+
+class FFprobeError(RuntimeError):
+    """Raised when ffprobe fails to probe audio duration."""
 
 
 # -- helpers ------------------------------------------------------------------
@@ -36,7 +48,10 @@ def _probe_duration_seconds(path: Path) -> float:
     -of default=noprint_wrappers=1:nokey=1 <path>``.
 
     Returns:
-        Duration in seconds, or ``0.0`` on any failure.
+        Duration in seconds.
+
+    Raises:
+        FFprobeError: on any failure (nonzero exit, empty stdout, parse error).
     """
     try:
         result = subprocess.run(
@@ -55,10 +70,15 @@ def _probe_duration_seconds(path: Path) -> float:
             check=False,
         )
         if result.returncode != 0 or not result.stdout.strip():
-            return 0.0
+            raise FFprobeError(
+                f"ffprobe failed (exit {result.returncode}): "
+                f"{result.stderr.strip() or 'empty stdout'}"
+            )
         return float(result.stdout.strip())
-    except Exception:
-        return 0.0
+    except FFprobeError:
+        raise
+    except Exception as exc:
+        raise FFprobeError(f"ffprobe exception: {exc}") from exc
 
 
 def _extract_chunk(
@@ -131,12 +151,12 @@ async def parse_audio(
 
     Workflow:
         1. SHA-based dedup key (first 16 hex chars).
-        2. Probe duration with ffprobe.
+        2. Probe duration with ffprobe (raises on failure).
         3. Warn (but continue) if duration exceeds ``max_audio_minutes``.
         4. Compute chunk boundaries (``CHUNK_MINUTES`` per chunk).
         5. Load completed-chunk set from progress file (if any).
         6. For each incomplete chunk: extract via ffmpeg, transcribe via
-           OpenRouter, mark done, persist progress.
+           OpenRouter (with built-in retry), mark done, persist progress.
         7. Concatenate chunk transcripts.  Clean up temp chunk directory.
 
     Args:
@@ -146,12 +166,21 @@ async def parse_audio(
 
     Returns:
         The full concatenated transcript.
+
+    Raises:
+        FFprobeError: if the audio file cannot be probed.
+        RuntimeError: if all chunks fail, chunk is oversize, or contract error.
     """
     sha = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     cache_root = cfg.brain_root / ".brain" / "cache"
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    dur = _probe_duration_seconds(path)
+    try:
+        dur = _probe_duration_seconds(path)
+    except FFprobeError as exc:
+        logger.warning("audio.ffprobe_failed", error=str(exc))
+        raise RuntimeError(f"cannot probe duration: {exc}") from exc
+
     dur_minutes = dur / 60.0
     if dur_minutes > cfg.ingestion.max_audio_minutes:
         logger.warning(
@@ -177,6 +206,7 @@ async def parse_audio(
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     chunks: list[str] = []
+    failed_chunks: list[int] = []
 
     for k in range(n_chunks):
         if k in done:
@@ -187,12 +217,51 @@ async def parse_audio(
 
         try:
             _extract_chunk(path, start, chunk_sec, tmp_chunk)
+        except Exception as e:
+            # Extraction failure (ffmpeg) — treat as chunk failure.
+            failed_chunks.append(k)
+            logger.warning("audio.chunk_extract_failed", chunk=k, error=str(e))
+            chunks.append("")
+            done.add(k)
+            prog_path.write_text(json.dumps(sorted(done)))
+            continue
+
+        # Size check — raise OUTSIDE the main except so oversize propagates.
+        if tmp_chunk.stat().st_size > MAX_CHUNK_BYTES:
+            raise RuntimeError(
+                f"chunk {k} exceeds max size: "
+                f"{tmp_chunk.stat().st_size} > {MAX_CHUNK_BYTES}"
+            )
+
+        try:
             text = await client.transcribe(cfg.models.stt, tmp_chunk)
             chunks.append(text)
             done.add(k)
             prog_path.write_text(json.dumps(sorted(done)))
+            logger.info("audio.chunk_done", chunk=k, chars=len(text))
+        except OpenRouterAPIError as e:
+            if e.status == 400 and k == 0:
+                raise RuntimeError(f"STT contract error (400): {e}") from e
+            failed_chunks.append(k)
+            logger.warning(
+                "audio.chunk_failed",
+                chunk=k,
+                status=e.status,
+                error_name=e.error_name,
+            )
+            chunks.append("")
+            done.add(k)
+            prog_path.write_text(json.dumps(sorted(done)))
+        except CreditExhaustedError:
+            raise
         except Exception as e:
-            chunks.append(f"\n[chunk {k + 1} transcribe failed: {e}]\n")
+            failed_chunks.append(k)
+            logger.warning(
+                "audio.chunk_failed",
+                chunk=k,
+                error_type=type(e).__name__,
+            )
+            chunks.append("")
             done.add(k)
             prog_path.write_text(json.dumps(sorted(done)))
 
@@ -204,4 +273,12 @@ async def parse_audio(
     except Exception:
         pass
 
-    return "\n".join(chunks)
+    n_failed = len(failed_chunks)
+    if n_failed == n_chunks:
+        raise RuntimeError(f"all {n_chunks} STT chunks failed")
+
+    sentinel = ""
+    if n_failed:
+        sentinel = f"\n<!-- sb:partial {n_failed}/{n_chunks} chunks failed -->"
+
+    return "\n".join(c for c in chunks if c) + sentinel

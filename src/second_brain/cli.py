@@ -23,6 +23,7 @@ import typer
 
 from second_brain import __version__
 from second_brain.config import load_config
+from second_brain.log import configure_logging
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -78,6 +79,7 @@ def watch() -> None:
     from second_brain.daemon.pipeline import run_daemon
 
     cfg = load_config()
+    configure_logging(cfg.brain_root)
     typer.echo(f"Watching {cfg.brain_root / '00-inbox'}/ ... Ctrl-C to stop.")
     asyncio.run(run_daemon(cfg))
 
@@ -100,6 +102,7 @@ def ingest(
         from second_brain.vectors.store import VectorStore
 
         cfg = load_config()
+        configure_logging(cfg.brain_root)
         client = OpenRouterClient(cfg)
         embedder = Embedder(client, cfg)
         dim = await embedder.ensure_dim()
@@ -187,6 +190,7 @@ def compact() -> None:
         from second_brain.vectors.store import VectorStore
 
         cfg = load_config()
+        configure_logging(cfg.brain_root)
         client = OpenRouterClient(cfg)
         embedder = Embedder(client, cfg)
         dim = await embedder.ensure_dim()
@@ -266,6 +270,8 @@ def serve(
     """Start the web UI server (Phase 5B).  Bound to 127.0.0.1 only."""
     from second_brain.web.app import run_server
 
+    cfg = load_config()
+    configure_logging(cfg.brain_root)
     typer.echo(
         f"Serving the brain at http://127.0.0.1:{port} (Ctrl-C to stop)."
     )
@@ -286,6 +292,7 @@ def ask(
         from second_brain.vectors.store import VectorStore
 
         cfg = load_config()
+        configure_logging(cfg.brain_root)
         client = OpenRouterClient(cfg)
         try:
             embedder = Embedder(client, cfg)

@@ -57,7 +57,7 @@ async def normalize_text(
     stage: str,
     cfg: Config,
     client: OpenRouterClient,
-) -> Path:
+) -> tuple[Path, str]:
     """Normalise a raw inbox file into a ``50-sources/<source_id>.md`` file.
 
     The output file has YAML front-matter (:class:`SourceMeta`) followed by
@@ -69,6 +69,9 @@ async def normalize_text(
     Args:
         client: OpenRouter client (needed for Wave-2 vision/STT parsers;
             Wave-1 parsers ignore it).
+
+    Returns:
+        ``(dst_path, body)`` where *body* is the parsed markdown body.
 
     Raises:
         NotImplementedError: if *stage* is a Wave-2 stage (pdf, vision, audio,
@@ -97,4 +100,4 @@ async def normalize_text(
 
     dst = cfg.brain_root / "50-sources" / f"{source_id}.md"
     write_atomic(dst, content)
-    return dst
+    return (dst, body)

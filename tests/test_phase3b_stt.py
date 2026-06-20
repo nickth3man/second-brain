@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess as _sp
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,7 @@ class FakeSTTClient:
         audio_path: Path,
         *,
         language: str | None = None,
+        audio_format: str | None = None,
     ) -> str:
         self.call_count += 1
         if self.fail_on_call is not None and self.call_count == self.fail_on_call:
@@ -89,7 +91,7 @@ class TestAudioChunking:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from second_brain.parse.audio import parse_audio
+        from second_brain.parse.audio import CHUNK_MINUTES, parse_audio
 
         monkeypatch.setattr(
             "second_brain.parse.audio._probe_duration_seconds",
@@ -99,6 +101,9 @@ class TestAudioChunking:
             "second_brain.parse.audio._extract_chunk",
             _fake_extract_chunk,
         )
+
+        # 1200s with CHUNK_MINUTES=4 -> ceil(1200/(4*60)) = ceil(5) = 5 chunks
+        expected_chunks = max(1, math.ceil(1200 / (CHUNK_MINUTES * 60)))
 
         client = FakeSTTClient()
         cfg = _FakeCfg(brain_root=tmp_path)
@@ -108,20 +113,20 @@ class TestAudioChunking:
 
         result = await parse_audio(p, cfg, client)
 
-        assert client.call_count == 2
-        assert "transcript:chunk_0.mp3" in result
-        assert "transcript:chunk_1.mp3" in result
+        assert client.call_count == expected_chunks
+        for k in range(expected_chunks):
+            assert f"transcript:chunk_{k}.mp3" in result
 
         prog_path = tmp_path / ".brain" / "cache" / f"{sha}.audio_progress.json"
         assert prog_path.is_file()
-        assert json.loads(prog_path.read_text()) == [0, 1]
+        assert json.loads(prog_path.read_text()) == list(range(expected_chunks))
 
     async def test_resume_skips_done_chunks(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from second_brain.parse.audio import parse_audio
+        from second_brain.parse.audio import CHUNK_MINUTES, parse_audio
 
         monkeypatch.setattr(
             "second_brain.parse.audio._probe_duration_seconds",
@@ -131,6 +136,8 @@ class TestAudioChunking:
             "second_brain.parse.audio._extract_chunk",
             _fake_extract_chunk,
         )
+
+        expected_chunks = max(1, math.ceil(1200 / (CHUNK_MINUTES * 60)))
 
         client = FakeSTTClient()
         cfg = _FakeCfg(brain_root=tmp_path)
@@ -145,17 +152,16 @@ class TestAudioChunking:
 
         result = await parse_audio(p, cfg, client)
 
-        assert client.call_count == 1
-        assert "transcript:chunk_1.mp3" in result
+        assert client.call_count == expected_chunks - 1
         assert "transcript:chunk_0.mp3" not in result
-        assert json.loads(prog_path.read_text()) == [0, 1]
+        assert json.loads(prog_path.read_text()) == list(range(expected_chunks))
 
-    async def test_chunk_failure_appends_error_note(
+    async def test_chunk_failure_appends_partial_sentinel(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from second_brain.parse.audio import parse_audio
+        from second_brain.parse.audio import CHUNK_MINUTES, parse_audio
 
         monkeypatch.setattr(
             "second_brain.parse.audio._probe_duration_seconds",
@@ -166,7 +172,10 @@ class TestAudioChunking:
             _fake_extract_chunk,
         )
 
-        # Fail on the second transcribe call
+        expected_chunks = max(1, math.ceil(1200 / (CHUNK_MINUTES * 60)))
+
+        # Fail on the second transcribe call; partial success produces sentinel.
+        # With fail_on_call=2: chunk 0 succeeds, chunk 1 fails, chunks 2+ succeed.
         client = FakeSTTClient(fail_on_call=2)
         cfg = _FakeCfg(brain_root=tmp_path)
         p = tmp_path / "test.mp3"
@@ -177,13 +186,16 @@ class TestAudioChunking:
 
         # First chunk succeeded
         assert "transcript:chunk_0.mp3" in result
-        # Second chunk error note appended
-        assert "transcribe failed" in result
-        assert "STT API error" in result
-        assert client.call_count == 2
-        # Both chunks marked done in progress
+        # Partial sentinel appended
+        assert "sb:partial" in result
+        # Only one chunk (the second) should have failed
+        assert "sb:partial 1" in result
+        # Old-style error note should NOT be present
+        assert "transcribe failed" not in result
+        assert client.call_count == expected_chunks
+        # All chunks marked done in progress
         prog_path = tmp_path / ".brain" / "cache" / f"{sha}.audio_progress.json"
-        assert json.loads(prog_path.read_text()) == [0, 1]
+        assert json.loads(prog_path.read_text()) == list(range(expected_chunks))
 
 
 # -- Video tests --------------------------------------------------------------

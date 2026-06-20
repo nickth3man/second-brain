@@ -17,6 +17,12 @@
 # .brain/ golden — golden test set (populated later)
 .brain/golden/
 
+# .brain/ logs — rotating structured logs (observability, §12.7)
+.brain/logs/
+
+# .brain/ state backups — transient write-then-backup
+.brain/state.json.bak
+
 # Python virtual environment
 .venv/
 

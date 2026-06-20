@@ -17,8 +17,10 @@ swallowed so one bad file does not crash the daemon.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import shutil
+import time
 from pathlib import Path
 
 import structlog
@@ -49,6 +51,67 @@ log = structlog.get_logger(__name__)
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 
+PER_FILE_TIMEOUT_S = 600
+
+
+# -- helpers ------------------------------------------------------------------
+
+
+def _fail_file_safe(
+    path: Path,
+    cfg: Config,
+    msg: str,
+    log_exc: bool = True,
+    store: BrainStateStore | None = None,
+    source_id: str | None = None,
+    sha: str | None = None,
+    exc: Exception | None = None,
+) -> None:
+    """Transition a file to FAILED, deadletter-copy, log, and save state.
+
+    This helper MUST never raise.  All operations are wrapped in try/except.
+    """
+    try:
+        if source_id and store:
+            # Ensure the source is registered before transitioning.
+            if source_id not in store.state.sources:
+                try:
+                    rel = path.resolve().relative_to(cfg.brain_root.resolve()).as_posix()
+                except Exception:
+                    rel = str(path)
+                store.record_source(
+                    source_id,
+                    SourceState(
+                        sha256=sha or "",
+                        raw=rel,
+                        type="unknown",
+                        stage=IngestStage.FAILED,
+                        error=msg,
+                    ),
+                )
+            store.transition(source_id, IngestStage.FAILED, error=msg)
+    except Exception:
+        pass
+
+    with contextlib.suppress(Exception):
+        _deadletter(path, cfg)
+
+    with contextlib.suppress(Exception):
+        log.error(
+            "pipeline.file.failed",
+            source_id=source_id,
+            sha=sha,
+            stage="failed",
+            error=msg,
+            error_type=type(exc).__name__ if exc else "Unknown",
+        )
+
+    try:
+        if store is not None:
+            store.save()
+    except Exception:
+        log.error("state.save_failed")
+
 
 # -- per-file pipeline --------------------------------------------------------
 
@@ -74,7 +137,6 @@ async def ingest_file(
         The final pipeline stage (``DONE`` or ``FAILED``).
     """
     # -- Stage 1: Hash & dedup -----------------------------------------
-    body = path.read_text(encoding="utf-8", errors="replace")
     sha = sha256_of_file(path)
 
     # Exact-sha256 dedup (§11)
@@ -85,7 +147,15 @@ async def ingest_file(
         return IngestStage.DONE
 
     ingested = now_iso()
-    source_id = source_id_for(path, body, ingested)
+    # Compute source_id here so the try block below has it.
+    # We read a small preview from the file for source_id_for.
+    try:
+        preview = path.read_text(encoding="utf-8", errors="replace")[:2000]
+    except Exception:
+        preview = ""
+    source_id = source_id_for(path, preview, ingested)
+
+    t_total = time.perf_counter()
 
     try:
         stage = route(path.suffix, cfg)
@@ -106,56 +176,89 @@ async def ingest_file(
             ),
         )
         store.transition(source_id, IngestStage.NORMALIZED)
+        log.info("pipeline.stage.start", source_id=source_id, sha=sha, stage="HASHING")
 
         # -- Stage 2: Normalise ---------------------------------------
+        t_stage = time.perf_counter()
         try:
-            await normalize_text(
+            _, body = await normalize_text(
                 path, source_id, sha, ingested, stage, cfg, client
             )
         except ValueError as e:
-            store.transition(source_id, IngestStage.FAILED, error=str(e))
-            _deadletter(path, cfg)
-            store.save()
-            store.append_changelog(
-                {
-                    "kind": "ingest",
-                    "action": "failed",
-                    "source": source_id,
-                    "error": str(e),
-                }
+            _fail_file_safe(
+                path, cfg, msg=str(e), store=store,
+                source_id=source_id, sha=sha, exc=e,
             )
             return IngestStage.FAILED
+        log.info(
+            "pipeline.stage.end",
+            source_id=source_id, sha=sha, stage="NORMALIZED",
+            latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+        )
+
+        # Check for partial transcription sentinel.
+        partial_sentinel = "<!-- sb:partial"
+        if partial_sentinel in body:
+            store.state.sources[source_id].partial = True
+            # Strip the sentinel from body before extract/embed.
+            idx = body.index(partial_sentinel)
+            close_idx = body.find("-->", idx)
+            if close_idx != -1:
+                sentinel = body[idx : close_idx + 3]
+                body = body.replace(sentinel, "").rstrip()
+                # Re-read and strip the sentinel from the saved source file.
+                src_path = cfg.brain_root / "50-sources" / f"{source_id}.md"
+                if src_path.exists():
+                    src_text = src_path.read_text(encoding="utf-8")
+                    src_text = src_text.replace(sentinel, "").rstrip()
+                    src_path.write_text(src_text, encoding="utf-8")
+            log.info(
+                "pipeline.partial",
+                source_id=source_id, sha=sha,
+            )
 
         # -- Stage 3: Extract -----------------------------------------
+        t_stage = time.perf_counter()
         store.transition(source_id, IngestStage.EXTRACTED)
+        log.info("pipeline.stage.start", source_id=source_id, sha=sha, stage="EXTRACTED")
         try:
             out = await extract(client, cfg, body, store.all_topic_titles())
         except CreditExhaustedError:
             raise
         except (ExtractionError, Exception) as e:
-            store.transition(source_id, IngestStage.FAILED, error=str(e))
-            _deadletter(path, cfg)
-            store.save()
-            store.append_changelog(
-                {
-                    "kind": "ingest",
-                    "action": "failed",
-                    "source": source_id,
-                    "error": str(e),
-                }
+            _fail_file_safe(
+                path, cfg, msg=str(e), store=store,
+                source_id=source_id, sha=sha, exc=e,
             )
             return IngestStage.FAILED
+        log.info(
+            "pipeline.stage.end",
+            source_id=source_id, sha=sha, stage="EXTRACTED",
+            latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+        )
 
         # -- Phase 2 embedding step (before linking) ------------------
         source_chunks: list[tuple[str, list[float]]] = []
         if embedder is not None and vec_store is not None:
             from second_brain.vectors.store import chunk_text
 
+            t_stage = time.perf_counter()
+            log.info(
+                "pipeline.stage.start",
+                source_id=source_id, sha=sha, stage="EMBEDDING",
+            )
             ctexts = chunk_text(body)
             cvecs = await embedder.embed_texts(ctexts)
             source_chunks = list(zip(ctexts, cvecs, strict=False))
+            log.info(
+                "pipeline.stage.end",
+                source_id=source_id, sha=sha, stage="EMBEDDING",
+                n_chunks=len(source_chunks),
+                latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+            )
 
         # -- Stage 4: Link --------------------------------------------
+        t_stage = time.perf_counter()
         ctx = LinkContext(
             brain_store=store,
             embedder=embedder,
@@ -165,6 +268,11 @@ async def ingest_file(
         )
         decisions = await linker.link(out.topics, ctx)
         store.transition(source_id, IngestStage.LINKED)
+        log.info(
+            "pipeline.stage.end",
+            source_id=source_id, sha=sha, stage="LINKED",
+            latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+        )
 
         # Upsert the source's chunks before the per-decision loop
         if vec_store is not None and source_chunks and decisions:
@@ -173,7 +281,12 @@ async def ingest_file(
             )
 
         # -- Stage 5: Wiki update -------------------------------------
+        t_stage = time.perf_counter()
         store.transition(source_id, IngestStage.WIKI_MERGED)
+        log.info(
+            "pipeline.stage.start",
+            source_id=source_id, sha=sha, stage="WIKI_MERGED",
+        )
         for decision in decisions:
             store.ensure_topic(
                 decision.target_slug,
@@ -217,6 +330,12 @@ async def ingest_file(
             for d in decisions:
                 vec_store.recompute_centroid(d.target_slug)
 
+        log.info(
+            "pipeline.stage.end",
+            source_id=source_id, sha=sha, stage="WIKI_MERGED",
+            latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+        )
+
         # -- Stage 6: Index -------------------------------------------
         index.mark_dirty()
         store.transition(source_id, IngestStage.INDEXED)
@@ -231,6 +350,15 @@ async def ingest_file(
             }
         )
 
+        total_latency_ms = round((time.perf_counter() - t_total) * 1000, 1)
+        log.info(
+            "pipeline.file.done",
+            source_id=source_id,
+            sha=sha,
+            topics_count=len(decisions),
+            total_latency_ms=total_latency_ms,
+        )
+
         return IngestStage.DONE
 
     except CreditExhaustedError:
@@ -238,16 +366,9 @@ async def ingest_file(
 
     except Exception as e:
         # Catch-all: one bad file must not crash the daemon
-        store.transition(source_id, IngestStage.FAILED, error=str(e))
-        _deadletter(path, cfg)
-        store.save()
-        store.append_changelog(
-            {
-                "kind": "ingest",
-                "action": "failed",
-                "source": source_id,
-                "error": str(e),
-            }
+        _fail_file_safe(
+            path, cfg, msg=str(e), store=store,
+            source_id=source_id, sha=sha, exc=e,
         )
         return IngestStage.FAILED
 
@@ -302,14 +423,21 @@ async def run_daemon(cfg: Config) -> None:
             path = await queue.get()
             log.info("daemon.ingest", path=str(path))
             try:
-                stage = await ingest_file(
-                    path, cfg, store, client, linker, index,
-                    embedder=embedder, vec_store=vec_store,
+                stage = await asyncio.wait_for(
+                    ingest_file(
+                        path, cfg, store, client, linker, index,
+                        embedder=embedder, vec_store=vec_store,
+                    ),
+                    timeout=PER_FILE_TIMEOUT_S,
                 )
                 log.info("daemon.done", path=str(path), stage=str(stage))
             except CreditExhaustedError:
                 log.error("daemon.credit_exhausted")
                 raise
+            except TimeoutError:
+                msg = f"file processing exceeded {PER_FILE_TIMEOUT_S}s timeout"
+                log.error("daemon.timeout", path=str(path))
+                _fail_file_safe(path, cfg, msg=msg, store=store)
             except Exception as e:
                 log.error("daemon.ingest_failed", path=str(path), error=str(e))
     except (KeyboardInterrupt, asyncio.CancelledError):

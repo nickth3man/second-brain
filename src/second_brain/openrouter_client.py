@@ -13,15 +13,20 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import keyring
+import structlog
+import tenacity
 
 from second_brain.config import Config
 from second_brain.reasoning import ThinkSplitter, strip_think
+
+log = structlog.get_logger(__name__)
 
 # -- exceptions --------------------------------------------------------------
 
@@ -32,6 +37,62 @@ class OpenRouterError(Exception):
 
 class CreditExhaustedError(OpenRouterError):
     """Raised on HTTP 402 — credit exhaustion stops the daemon (§12.3)."""
+
+
+class OpenRouterAPIError(OpenRouterError):
+    """Raised on non-402 HTTP errors with structured context.
+
+    Attributes:
+        status: HTTP status code.
+        endpoint: The API endpoint path (e.g. ``"/chat/completions"``).
+        body: The raw response text (truncated to 2000 chars).
+        error_name: Parsed ``error.name`` from the response body, if any.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        endpoint: str,
+        body: str,
+        error_name: str | None = None,
+    ) -> None:
+        self.status = status
+        self.endpoint = endpoint
+        self.body = body[:2000]
+        self.error_name = error_name
+        preview = body[:500]
+        msg = f"OpenRouter API error {status} on {endpoint}"
+        if error_name:
+            msg += f" ({error_name})"
+        msg += f": {preview}"
+        super().__init__(msg)
+
+
+# -- STT retry constants -----------------------------------------------------
+
+_RETRYABLE_STATUSES: set[int] = {429, 500, 502, 503}
+MAX_STT_RETRIES = 3
+
+# -- audio format mapping ---------------------------------------------------
+
+
+_AUDIO_FORMAT_MAP: dict[str, str] = {
+    ".mp3": "mp3",
+    ".wav": "wav",
+    ".m4a": "m4a",
+    ".webm": "webm",
+    ".ogg": "ogg",
+    ".flac": "flac",
+    ".aac": "aac",
+}
+
+
+def audio_format_for(path: Path) -> str:
+    """Return the audio container string for *path* based on its suffix.
+
+    Defaults to ``"mp3"`` for unknown extensions.
+    """
+    return _AUDIO_FORMAT_MAP.get(path.suffix.lower(), "mp3")
 
 
 # -- key resolution ----------------------------------------------------------
@@ -134,6 +195,100 @@ class OpenRouterClient:
             params["data_collection"] = "deny"
         return params
 
+    # -- shared boundary --------------------------------------------------
+
+    async def _post(
+        self,
+        endpoint: str,
+        body: dict[str, Any],
+        *,
+        model: str,
+        req_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """POST to *endpoint* with structured logging and error wrapping.
+
+        All non-streaming API methods route through this boundary so that
+        request/response/error observability is consistent.
+
+        Args:
+            endpoint: API path (e.g. ``"/chat/completions"``).
+            body: JSON-serialisable request body (includes ``provider``).
+            model: Model slug for logging context.
+            req_meta: Optional metadata dict for the log line (NEVER include
+                payload content, only counts/sizes).
+
+        Returns:
+            Parsed JSON response dict.
+
+        Raises:
+            CreditExhaustedError: on HTTP 402.
+            OpenRouterAPIError: on other >=400 responses.
+        """
+        meta = req_meta or {}
+        log.info(
+            "openrouter.request",
+            endpoint=endpoint,
+            model=model,
+            zdr=bool(self.cfg.privacy.zdr),
+            **meta,
+        )
+
+        t0 = time.perf_counter()
+        resp = await self.client.post(endpoint, json=body)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+        if resp.status_code == 402:
+            log.error(
+                "openrouter.error",
+                endpoint=endpoint,
+                model=model,
+                status=402,
+                latency_ms=latency_ms,
+                error_name="CreditExhausted",
+            )
+            raise CreditExhaustedError(
+                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
+            )
+
+        if resp.status_code >= 400:
+            error_name: str | None = None
+            try:
+                err_data = resp.json()
+                error_name = err_data.get("error", {}).get("name")
+            except Exception:
+                pass
+            log.error(
+                "openrouter.error",
+                endpoint=endpoint,
+                model=model,
+                status=resp.status_code,
+                latency_ms=latency_ms,
+                error_name=error_name,
+                error_message=(
+                    resp.json().get("error", {}).get("message", "")
+                    if error_name
+                    else ""
+                ),
+                error_body_preview=resp.text[:500],
+            )
+            raise OpenRouterAPIError(
+                status=resp.status_code,
+                endpoint=endpoint,
+                body=resp.text,
+                error_name=error_name,
+            )
+
+        log.info(
+            "openrouter.response",
+            endpoint=endpoint,
+            model=model,
+            status=resp.status_code,
+            latency_ms=latency_ms,
+            resp_bytes=len(resp.content),
+            text_preview=(resp.text or "")[:200],
+        )
+        return resp.json()
+
     # -- API methods -----------------------------------------------------
 
     async def vision_describe(
@@ -158,11 +313,11 @@ class OpenRouterClient:
             mime: MIME type of the images (default ``image/png``).
 
         Returns:
-            The model's text response.
+            The model's text response (``<think>``-stripped).
 
         Raises:
             CreditExhaustedError: on HTTP 402.
-            httpx.HTTPStatusError: on other HTTP errors.
+            OpenRouterAPIError: on other HTTP errors.
         """
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for im in images:
@@ -178,13 +333,13 @@ class OpenRouterClient:
             "messages": [{"role": "user", "content": content}],
             "provider": self._zdr_provider(),
         }
-        resp = await self.client.post("/chat/completions", json=body)
-        if resp.status_code == 402:
-            raise CreditExhaustedError(
-                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
-            )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"]
+        resp = await self._post(
+            "/chat/completions",
+            body,
+            model=model,
+            req_meta={"n_images": len(images)},
+        )
+        raw = resp["choices"][0]["message"]["content"]
         # Strip <think>...</think> — reasoning models leak CoT into content.
         _, clean_content = strip_think(raw)
         return clean_content
@@ -195,41 +350,67 @@ class OpenRouterClient:
         audio_path: Path,
         *,
         language: str | None = None,
+        audio_format: str | None = None,
     ) -> str:
         """Transcribe an audio file via OpenRouter's /audio/transcriptions.
 
-        Sends the file as **multipart/form-data** (not JSON).  ZDR is conveyed
-        through the default HTTP-Referer / X-Title headers (the existing client
-        headers); no ``provider`` field is sent in the multipart body.
+        Sends the audio as **base64 inline JSON** (not multipart) — OpenRouter
+        rejects multipart with ``ZodError``.  ZDR is enforced via the
+        ``provider`` sub-dict in the JSON body.
+
+        Retries on ``httpx.TimeoutException``, ``httpx.ConnectError``, or
+        ``OpenRouterAPIError`` with retryable status (429/500/502/503).
+        Non-retryable statuses (400/401/402/404) raise immediately.
+        402 remains :class:`CreditExhaustedError`.
 
         Args:
             model: OpenRouter STT model slug.
             audio_path: Path to the audio file on disk.
             language: Optional ISO language code hint.
+            audio_format: Audio container format (e.g. ``"mp3"``, ``"wav"``).
+                Auto-detected from *audio_path* suffix if not given.
 
         Returns:
             The transcribed text.
 
         Raises:
-            CreditExhaustedError: on HTTP 402.
-            httpx.HTTPStatusError: on other HTTP errors.
+            CreditExhaustedError: on HTTP 402 (non-retryable).
+            OpenRouterAPIError: on non-retryable HTTP errors.
         """
-        data: dict[str, Any] = {"model": model}
-        if language is not None:
-            data["language"] = language
+        raw = audio_path.read_bytes()
+        b64 = base64.b64encode(raw).decode("ascii")  # NO data: URI prefix
+        fmt = audio_format or audio_format_for(audio_path)
 
-        with open(audio_path, "rb") as f:
-            resp = await self.client.post(
-                "/audio/transcriptions",
-                files={"file": (audio_path.name, f, "audio/mpeg")},
-                data=data,
+        body: dict[str, Any] = {
+            "model": model,
+            "input_audio": {"data": b64, "format": fmt},
+            "provider": self._zdr_provider(),
+        }
+        if language is not None:
+            body["language"] = language
+
+        def _is_retryable(exc: Exception) -> bool:
+            if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+                return True
+            return (
+                isinstance(exc, OpenRouterAPIError)
+                and exc.status in _RETRYABLE_STATUSES
             )
-        if resp.status_code == 402:
-            raise CreditExhaustedError(
-                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
-            )
-        resp.raise_for_status()
-        return resp.json()["text"]
+
+        async for attempt in tenacity.AsyncRetrying(
+            stop=tenacity.stop_after_attempt(MAX_STT_RETRIES),
+            wait=tenacity.wait_exponential_jitter(initial=1, max=10),
+            retry=tenacity.retry_if_exception(_is_retryable),
+            reraise=True,
+        ):
+            with attempt:
+                resp = await self._post(
+                    "/audio/transcriptions",
+                    body,
+                    model=model,
+                    req_meta={"audio_bytes": len(raw), "format": fmt},
+                )
+                return resp["text"]
 
     async def chat_completion(
         self,
@@ -255,7 +436,7 @@ class OpenRouterClient:
         Raises:
             NotImplementedError: if *stream* is True.
             CreditExhausted: on HTTP 402.
-            httpx.HTTPStatusError: on other HTTP errors.
+            OpenRouterAPIError: on other HTTP errors.
         """
         if stream:
             raise NotImplementedError("Streaming not yet available (Phase 6).")
@@ -270,13 +451,12 @@ class OpenRouterClient:
         if extra_body:
             body.update(extra_body)
 
-        resp = await self.client.post("/chat/completions", json=body)
-        if resp.status_code == 402:
-            raise CreditExhaustedError(
-                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
-            )
-        resp.raise_for_status()
-        return resp.json()
+        return await self._post(
+            "/chat/completions",
+            body,
+            model=model,
+            req_meta={"input_chars": sum(len(m.get("content", "")) for m in messages)},
+        )
 
     async def chat_completion_clean(
         self,
@@ -393,20 +573,19 @@ class OpenRouterClient:
 
         Raises:
             CreditExhausted: on HTTP 402.
-            httpx.HTTPStatusError: on other HTTP errors.
+            OpenRouterAPIError: on other HTTP errors.
         """
-        resp = await self.client.post(
+        body = {
+            "model": model,
+            "input": input,
+            "provider": self._zdr_provider(),
+        }
+        resp = await self._post(
             "/embeddings",
-            json={
-                "model": model,
-                "input": input,
-                "provider": self._zdr_provider(),
+            body,
+            model=model,
+            req_meta={
+                "input_chars": len(input) if isinstance(input, str) else sum(len(t) for t in input)
             },
         )
-        if resp.status_code == 402:
-            raise CreditExhaustedError(
-                "OpenRouter credit exhausted. Top up at https://openrouter.ai/credits"
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["data"][0]["embedding"]
+        return resp["data"][0]["embedding"]
