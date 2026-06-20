@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "topics": {
+    "introspection---self-reflection": {
+      "title": "Introspection & Self-Reflection",
+      "type": "concept",
+      "tags": [],
+      "aliases": [],
+      "sources": [
+        "2026-06-19-michael-jackson---off-the-wall-audio"
+      ],
+      "links_to": [],
+      "linked_from": [],
+      "confidence": 0.55,
+      "created": "2026-06-20T00:00:40Z",
+      "updated": "2026-06-20T00:00:40Z"
+    },
+    "art---exhibition-curation": {
+      "title": "Art & Exhibition Curation",
+      "type": "concept",
+      "tags": [],
+      "aliases": [],
+      "sources": [
+        "2026-06-19-michael-jackson---off-the-wall-audio"
+      ],
+      "links_to": [],
+      "linked_from": [],
+      "confidence": 0.5,
+      "created": "2026-06-20T00:00:40Z",
+      "updated": "2026-06-20T00:00:40Z"
+    },
+    "lyrical---poetic-fragments": {
+      "title": "Lyrical & Poetic Fragments",
+      "type": "concept",
+      "tags": [],
+      "aliases": [],
+      "sources": [
+        "2026-06-19-michael-jackson---off-the-wall-audio"
+      ],
+      "links_to": [],
+      "linked_from": [],
+      "confidence": 0.6,
+      "created": "2026-06-20T00:00:40Z",
+      "updated": "2026-06-20T00:00:40Z"
+    },
+    "inner-worlds---spatial-metaphor": {
+      "title": "Inner Worlds & Spatial Metaphor",
+      "type": "concept",
+      "tags": [],
+      "aliases": [],
+      "sources": [
+        "2026-06-19-michael-jackson---off-the-wall-audio"
+      ],
+      "links_to": [],
+      "linked_from": [],
+      "confidence": 0.5,
+      "created": "2026-06-20T00:00:40Z",
+      "updated": "2026-06-20T00:00:40Z"
+    },
+    "creative-prompts---generative-seeds": {
+      "title": "Creative Prompts & Generative Seeds",
+      "type": "concept",
+      "tags": [],
+      "aliases": [],
+      "sources": [
+        "2026-06-19-michael-jackson---off-the-wall-audio"
+      ],
+      "links_to": [],
+      "linked_from": [],
+      "confidence": 0.55,
+      "created": "2026-06-20T00:00:40Z",
+      "updated": "2026-06-20T00:00:40Z"
+    }
+  },
+  "sources": {
+    "2026-06-19-michael-jackson---off-the-wall-audio": {
+      "sha256": "ea865661b786f547db14a7e245e467186039ba067f9768162b44e20b5d6b8acf",
+      "topics": [],
+      "raw": "00-inbox/Michael Jackson - Off the Wall (Audio).mp3",
+      "embedding_model": null,
+      "stage": "done",
+      "tokens": 0,
+      "type": "audio",
+      "ingested": "2026-06-19T23:59:44Z",
+      "error": null,
+      "partial": false
+    }
+  },
+  "updated": "2026-06-20T00:00:40Z"
+}
