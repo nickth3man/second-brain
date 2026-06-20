@@ -21,7 +21,7 @@
 .brain/logs/
 
 # .brain/ state backups — transient write-then-backup
-.brain/state.json.bak
+.brain/state.json.bak*
 
 # Python virtual environment
 .venv/

@@ -49,6 +49,25 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _summarize_structured(path: Path) -> str:
+    """Produce a compact markdown summary for a structured data file.
+
+    CSV/TSV files are summarised as column tables + sample rows.
+    JSON files are summarised as a type/shape tree + key sample.
+    """
+    ext = path.suffix.lower()
+    if ext in (".csv", ".tsv"):
+        from second_brain.parse.csv_table import summarize_csv
+
+        return summarize_csv(path)
+    if ext == ".json":
+        from second_brain.parse.csv_table import summarize_json
+
+        return summarize_json(path)
+    # Other structured types (XML, YAML, etc.) fall back to verbatim text.
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 async def normalize_text(
     path: Path,
     source_id: str,
@@ -80,7 +99,12 @@ async def normalize_text(
     """
     from second_brain.parse import parse_to_markdown
 
-    body = await parse_to_markdown(path, stage, cfg, client)
+    # Structured files (CSV/TSV/JSON) get a compact summary instead of
+    # raw verbatim text, which would produce too many topics and waste tokens.
+    if stage == "structured":
+        body = _summarize_structured(path)
+    else:
+        body = await parse_to_markdown(path, stage, cfg, client)
 
     try:
         rel = path.resolve().relative_to(cfg.brain_root.resolve()).as_posix()

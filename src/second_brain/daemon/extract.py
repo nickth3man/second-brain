@@ -41,6 +41,32 @@ CONSTRAINTS:
 - If unsure about a link, confidence < 0.6.
 """
 
+STRUCTURED_SYSTEM_PROMPT = """\
+You are summarizing a structured/tabular data file for a personal second brain.
+
+INPUT:
+- A compact markdown summary of the dataset (columns, types, sample rows, shape).
+- Existing topic titles for context.
+
+JOB:
+1. Produce **exactly ONE** topic that faithfully describes the dataset.
+2. Name the topic after the dataset — a concise descriptive title derived
+   from the content + filename (e.g. "NBA Team Game Stats — Data Dictionary"
+   or "Player Per-Game Box Scores").
+3. The topic's `merged_section`: a faithful markdown synthesis describing:
+   - What the dataset is.
+   - What each row represents (granularity).
+   - The column groups, key metrics, and units.
+   - What analysis or questions the dataset supports.
+   Compress; do NOT dump rows.
+4. Set `action` to "new" and `target_slug` to empty string.
+5. Confidence should be 0.85+ (it's a direct description).
+
+CONSTRAINTS:
+- NEVER invent columns, metrics, or analysis capabilities not present.
+- Quote sparingly; prefer compression.
+"""
+
 # -- exceptions ----------------------------------------------------------------
 
 
@@ -54,17 +80,30 @@ class ExtractionError(Exception):
 def build_messages(
     source_body: str,
     existing_titles: dict[str, str],
+    *,
+    source_type: str | None = None,
 ) -> list[dict]:
     """Build the messages list for the librarian chat completion.
 
     Truncates *source_body* if its estimated token count exceeds 16 000
     (§12.2: map-reduce deferred in Phase 1).
+
+    Args:
+        source_type: If ``"structured"``, uses the structured-data prompt
+            (exactly ONE topic). Otherwise uses the default librarian prompt
+            (3–7 topics).
     """
     if estimate_tokens(source_body) > 16000:
         source_body = (
             source_body[:64000]
             + "\n\n[truncated for extraction — map-reduce deferred §12.2]"
         )
+
+    prompt = (
+        STRUCTURED_SYSTEM_PROMPT
+        if source_type == "structured"
+        else LIBRARIAN_SYSTEM_PROMPT
+    )
 
     parts = [f"SOURCE:\n\n{source_body}"]
     if existing_titles:
@@ -74,7 +113,7 @@ def build_messages(
         parts.append(f"\n\nEXISTING TOPICS:\n{titles_str}")
 
     return [
-        {"role": "system", "content": LIBRARIAN_SYSTEM_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
 
@@ -104,8 +143,15 @@ async def extract(
     cfg,
     source_body: str,
     existing_titles: dict[str, str],
+    *,
+    source_type: str | None = None,
 ) -> LibrarianOutput:
     """Extract structured output from a source via the librarian LLM.
+
+    Args:
+        source_type: If ``"structured"``, uses the structured-data prompt
+            (exactly ONE topic). Otherwise uses the default librarian prompt
+            (3–7 topics).
 
     Attempts the **primary model** first, then falls back to the **repair
     model** on 5xx / parse errors.
@@ -125,7 +171,7 @@ async def extract(
     repair_model = cfg.extraction.repair_model
 
     async def _try(model_name: str) -> LibrarianOutput:
-        messages = build_messages(source_body, existing_titles)
+        messages = build_messages(source_body, existing_titles, source_type=source_type)
         resp = await client.chat_completion(
             model_name,
             messages,

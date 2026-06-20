@@ -222,7 +222,10 @@ async def ingest_file(
         store.transition(source_id, IngestStage.EXTRACTED)
         log.info("pipeline.stage.start", source_id=source_id, sha=sha, stage="EXTRACTED")
         try:
-            out = await extract(client, cfg, body, store.all_topic_titles())
+            out = await extract(
+                client, cfg, body, store.all_topic_titles(),
+                source_type=stage,
+            )
         except CreditExhaustedError:
             raise
         except (ExtractionError, Exception) as e:
