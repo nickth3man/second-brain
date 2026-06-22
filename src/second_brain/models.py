@@ -152,6 +152,9 @@ class BrainState(BaseModel):
     # ``state.json`` files loadable (backward compat via ``extra="ignore"``).
     last_compaction_ts: str = ""        # ISO 8601 of last compaction run
     sources_since_compaction: int = 0   # counter, reset on compaction
+    embedding_model: str = ""
+    embedding_dim: int = 0
+    embedding_swap_in_progress: dict[str, Any] | None = None
 
     @model_validator(mode="before")
     @classmethod

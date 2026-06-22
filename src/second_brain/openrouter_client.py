@@ -14,9 +14,10 @@ import base64
 import json
 import os
 import time
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 import keyring
@@ -75,6 +76,10 @@ class OpenRouterAPIError(OpenRouterError):
         super().__init__(msg)
 
 
+class SensitiveRoutingError(OpenRouterError):
+    """Raised when sensitive content would be sent without strict ZDR routing."""
+
+
 # -- STT retry constants -----------------------------------------------------
 
 _RETRYABLE_STATUSES: set[int] = {429, 500, 502, 503, 504}
@@ -99,6 +104,19 @@ def audio_format_for(path: Path) -> str:
     Defaults to ``"mp3"`` for unknown extensions.
     """
     return _AUDIO_FORMAT_MAP.get(path.suffix.lower(), "mp3")
+
+
+def is_sensitive_path(cfg: Config, path: Path) -> bool:
+    """Return True when *path* is under a configured sensitive inbox path."""
+    try:
+        rel = path.resolve().relative_to(cfg.brain_root.resolve()).as_posix().lower()
+    except Exception:
+        rel = path.as_posix().lower()
+    if rel.startswith("00-inbox/sensitive/"):
+        return True
+    privacy = getattr(cfg, "privacy", None)
+    patterns = getattr(privacy, "sensitive_patterns", []) or []
+    return any(pattern.strip("/").lower() in rel for pattern in patterns)
 
 
 # -- key resolution ----------------------------------------------------------
@@ -158,6 +176,7 @@ class OpenRouterClient:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self._client: httpx.AsyncClient | None = None
+        self._sensitive_mode = False
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -187,19 +206,64 @@ class OpenRouterClient:
 
     # -- provider params -------------------------------------------------
 
-    def _zdr_provider(self) -> dict[str, Any]:
+    @contextmanager
+    def sensitive_mode(self) -> Any:
+        """Temporarily require strict ZDR routing for every request."""
+        old = self._sensitive_mode
+        self._sensitive_mode = True
+        try:
+            yield
+        finally:
+            self._sensitive_mode = old
+
+    def _zdr_provider(self, *, sensitive: bool = False) -> dict[str, Any]:
         """Build the ``provider`` sub-dict enforcing ZDR (§12.7).
 
         Only includes keys whose value is truthy. Strips Nones.
         """
+        strict = sensitive or self._sensitive_mode
+        if strict and not self.cfg.privacy.zdr:
+            raise SensitiveRoutingError(
+                "sensitive content requires privacy.zdr=true; refusing non-ZDR routing"
+            )
         params: dict[str, Any] = {}
-        if self.cfg.privacy.zdr:
+        if self.cfg.privacy.zdr or strict:
             params["zdr"] = True
-        if self.cfg.extraction.require_parameters:
+        if self.cfg.extraction.require_parameters or strict:
             params["require_parameters"] = True
-        if self.cfg.privacy.block_training_providers:
+        if self.cfg.privacy.block_training_providers or strict:
             params["data_collection"] = "deny"
         return params
+
+    async def verify_zdr_status(self) -> dict[str, Any]:
+        """Return honest ZDR verification status for ``brain init``.
+
+        OpenRouter's documented ``/endpoints/zdr`` endpoint previews the impact
+        of request-level ZDR routing. It does not prove account-level dashboard
+        toggles are enabled, so those remain manual/unconfirmed.
+        """
+        try:
+            resp = await self.client.get("/endpoints/zdr")
+        except Exception as exc:
+            return {
+                "request_level_zdr_endpoint": "unavailable",
+                "account_level_zdr": "manual_unconfirmed",
+                "message": f"Could not verify OpenRouter ZDR preview endpoint: {exc}",
+            }
+        if resp.status_code == 200:
+            return {
+                "request_level_zdr_endpoint": "verified",
+                "account_level_zdr": "manual_unconfirmed",
+                "message": (
+                    "OpenRouter ZDR endpoint preview is reachable; account-level "
+                    "privacy toggles still require manual confirmation."
+                ),
+            }
+        return {
+            "request_level_zdr_endpoint": "unverified",
+            "account_level_zdr": "manual_unconfirmed",
+            "message": f"OpenRouter ZDR preview returned HTTP {resp.status_code}.",
+        }
 
     # -- shared boundary --------------------------------------------------
 
@@ -502,7 +566,7 @@ class OpenRouterClient:
         # *isn't* on either provider — the ``provider.only`` list will be
         # ignored by OpenRouter when no provider in the list serves the
         # requested model, falling back to the next cheapest available.
-        stt_provider = self._zdr_provider()
+        stt_provider = self._zdr_provider(sensitive=is_sensitive_path(self.cfg, audio_path))
         stt_provider["only"] = ["groq", "together"]
 
         body: dict[str, Any] = {

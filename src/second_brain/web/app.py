@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import textwrap
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
@@ -61,7 +62,25 @@ def create_app(cfg=None) -> FastAPI:
     if cfg is None:
         cfg = load_config()
 
-    app = FastAPI(title="Second Brain", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        import httpx
+
+        app.state.daemon_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=1.0),
+            base_url=(
+                f"http://{cfg.daemon.http_host}:"
+                f"{cfg.daemon.http_port}"
+            ),
+        )
+        try:
+            yield
+        finally:
+            client = getattr(app.state, "daemon_client", None)
+            if client is not None:
+                await client.aclose()
+
+    app = FastAPI(title="Second Brain", version="0.1.0", lifespan=lifespan)
 
     # Jinja2 templates
     templates = Jinja2Templates(directory=str(TEMPLATES))
@@ -338,26 +357,6 @@ def create_app(cfg=None) -> FastAPI:
             event_gen(),
             media_type="text/event-stream",
         )
-
-    # -- lifecycle: shared httpx client for daemon calls (§12.1) ---------
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        import httpx
-
-        app.state.daemon_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=1.0),
-            base_url=(
-                f"http://{cfg.daemon.http_host}:"
-                f"{cfg.daemon.http_port}"
-            ),
-        )
-
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        client = getattr(app.state, "daemon_client", None)
-        if client is not None:
-            await client.aclose()
 
     return app
 

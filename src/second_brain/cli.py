@@ -10,6 +10,7 @@ Usage::
     brain compact  # run compaction pass (Phase 4)
     brain health   # run health check (Phase 4)
     brain ask      # interactive chat (Phase 6)
+    brain embedding-swap # blue/green embedding model swap
     brain --version # show version
 """
 
@@ -70,6 +71,16 @@ def init() -> None:
         "Enable the 4 model-group ZDR toggles at "
         "https://openrouter.ai/settings/privacy (one-time)."
     )
+    try:
+        from second_brain.openrouter_client import OpenRouterClient
+
+        status = asyncio.run(OpenRouterClient(cfg).verify_zdr_status())
+        typer.echo(status["message"])
+    except Exception as exc:
+        typer.echo(
+            "Account-level ZDR remains manually unconfirmed; "
+            f"automatic verification unavailable ({exc})."
+        )
     typer.echo("Second Brain initialized successfully.")
 
 
@@ -393,6 +404,34 @@ def health() -> None:
     health_md = render_health_markdown(report)
     typer.echo("---")
     typer.echo(health_md)
+
+
+@app.command("embedding-swap")
+def embedding_swap(
+    model: Annotated[str, typer.Argument(help="New OpenRouter embedding model slug.")],
+) -> None:
+    """Swap embedding models using the blue/green workflow (§12.6)."""
+
+    async def _swap() -> None:
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.state import BrainStateStore
+        from second_brain.vectors.swap import swap_embeddings
+
+        cfg = load_config()
+        configure_logging(cfg.brain_root)
+        store = BrainStateStore.load(cfg)
+        client = OpenRouterClient(cfg)
+        try:
+            result = await swap_embeddings(cfg, store, client, new_model=model)
+        finally:
+            await client.close()
+        typer.echo(
+            f"Embedding swap {result.status}: {result.model} "
+            f"dim={result.dim} old_score={result.old_score:.3f} "
+            f"new_score={result.new_score:.3f}"
+        )
+
+    asyncio.run(_swap())
 
 
 @app.command()

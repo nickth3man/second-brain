@@ -1,9 +1,8 @@
-"""Video parser — audio-based STT with deferred vision (§6).
+"""Video parser — audio-based STT with optional keyframe vision (§6).
 
 Extracts the audio track via ffmpeg and delegates to :func:`parse_audio`
-for chunked STT transcription.  Keyframe extraction + vision description
-is intentionally deferred (the transcript is the primary signal for
-knowledge ingestion).
+for chunked STT transcription. Optional bounded keyframe extraction augments
+the transcript with visual observations from the configured vision model.
 """
 
 from __future__ import annotations
@@ -27,16 +26,16 @@ async def parse_video(
     cfg: Config,
     client: OpenRouterClient,
 ) -> str:
-    """Transcribe a video file by extracting audio and delegating to STT.
+    """Transcribe a video file and optionally add bounded keyframe vision.
 
     Workflow:
         1. Compute a SHA-based key for the temp audio file.
         2. Extract the audio track to ``.brain/cache/<sha>_audio.mp3`` via
            ffmpeg (re-encode to MP3 for Whisper compatibility).
         3. Delegate to :func:`parse_audio` for chunked STT.
-        4. Best-effort cleanup of the temp MP3.
-
-    Keyframe → vision description is **deferred** (see §6).
+        4. Extract representative keyframes if enabled and describe them with
+           the configured OpenRouter vision model.
+        5. Best-effort cleanup of temporary media files.
 
     Args:
         path: Path to the video file.
@@ -78,9 +77,86 @@ async def parse_video(
         return f"[video audio extraction failed: {e}]"
 
     transcript = await parse_audio(tmp_mp3, cfg, client)
+    observations = []
+    if getattr(cfg.ingestion, "video_keyframe_vision", True):
+        frames = _extract_keyframes(path, cfg, sha)
+        observations = await _describe_keyframes(frames, cfg, client)
 
     # Best-effort cleanup
     with contextlib.suppress(Exception):
         tmp_mp3.unlink(missing_ok=True)
+    for frame in frames if "frames" in locals() else []:
+        with contextlib.suppress(Exception):
+            frame.unlink(missing_ok=True)
 
-    return transcript
+    return _merge_video_markdown(transcript, observations)
+
+
+def _extract_keyframes(path: Path, cfg: Config, sha: str) -> list[Path]:
+    """Extract bounded representative keyframes with ffmpeg."""
+    max_frames = max(0, int(getattr(cfg.ingestion, "video_keyframe_max_frames", 8)))
+    if max_frames == 0:
+        return []
+    cadence = max(1, int(getattr(cfg.ingestion, "video_keyframe_cadence_seconds", 120)))
+    cache = cfg.brain_root / ".brain" / "cache" / f"{sha}_keyframes"
+    cache.mkdir(parents=True, exist_ok=True)
+    pattern = cache / "frame_%03d.png"
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-vf",
+                f"fps=1/{cadence},scale='min(1280,iw)':-2",
+                "-frames:v",
+                str(max_frames),
+                str(pattern),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning("video.keyframes_failed", returncode=result.returncode)
+            return []
+    except Exception as exc:
+        logger.warning("video.keyframes_failed", error=str(exc))
+        return []
+    return sorted(cache.glob("frame_*.png"))[:max_frames]
+
+
+async def _describe_keyframes(
+    frames: list[Path],
+    cfg: Config,
+    client: OpenRouterClient,
+) -> list[str]:
+    """Describe frames one at a time to stay under provider image limits."""
+    observations: list[str] = []
+    for idx, frame in enumerate(frames, 1):
+        try:
+            text = await client.vision_describe(
+                cfg.models.vision,
+                [frame.read_bytes()],
+                (
+                    "Describe visible information in this video keyframe for "
+                    f"knowledge ingestion. Frame {idx} of {len(frames)}. "
+                    "Mention on-screen text, diagrams, people, objects, and "
+                    "scene changes. Do not infer unsupported facts."
+                ),
+            )
+        except Exception as exc:
+            logger.warning("video.keyframe_vision_failed", frame=str(frame), error=str(exc))
+            continue
+        observations.append(f"Frame {idx}: {text.strip()}")
+    return observations
+
+
+def _merge_video_markdown(transcript: str, observations: list[str]) -> str:
+    if not observations:
+        return transcript
+    lines = ["## Transcript", transcript.strip()]
+    if observations:
+        lines.extend(["", "## Visual Observations", *[f"- {obs}" for obs in observations]])
+    return "\n\n".join(part for part in lines if part)

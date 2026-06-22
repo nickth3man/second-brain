@@ -41,8 +41,8 @@ def _can_open_exclusively(path: Path) -> bool:
         from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
-        CreateFileW = kernel32.CreateFileW
-        CreateFileW.argtypes = [
+        create_file_w = kernel32.CreateFileW
+        create_file_w.argtypes = [
             wintypes.LPCWSTR,
             wintypes.DWORD,
             wintypes.DWORD,
@@ -51,24 +51,24 @@ def _can_open_exclusively(path: Path) -> bool:
             wintypes.DWORD,
             wintypes.HANDLE,
         ]
-        CreateFileW.restype = wintypes.HANDLE
+        create_file_w.restype = wintypes.HANDLE
 
-        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-        GENERIC_READ = 0x80000000
-        OPEN_EXISTING = 3
-        FILE_SHARE_NONE = 0
-        FILE_ATTRIBUTE_NORMAL = 0x80
+        invalid_handle_value = wintypes.HANDLE(-1).value
+        generic_read = 0x80000000
+        open_existing = 3
+        file_share_none = 0
+        file_attribute_normal = 0x80
 
-        handle = CreateFileW(
+        handle = create_file_w(
             str(path),
-            GENERIC_READ,
-            FILE_SHARE_NONE,
+            generic_read,
+            file_share_none,
             None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            open_existing,
+            file_attribute_normal,
             None,
         )
-        if handle == INVALID_HANDLE_VALUE:
+        if handle == invalid_handle_value:
             return False
         kernel32.CloseHandle(handle)
         return True

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "second-brain"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.6",
     "pydantic-settings",
@@ -28,6 +28,8 @@ dependencies = [
     "uvicorn[standard]",
     "python-multipart",
     "pydantic-ai",
+    "openpyxl>=3.1.5",
+    "python-pptx>=1.0.2",
 ]
 
 [project.optional-dependencies]
@@ -47,7 +49,7 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "N"]

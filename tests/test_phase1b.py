@@ -20,7 +20,6 @@ from second_brain.daemon.extract import (
     extract,
     schema_for_strict,
 )
-from second_brain.openrouter_client import OpenRouterAPIError
 from second_brain.daemon.index import DebouncedIndex
 from second_brain.daemon.linker import LinkContext, SlugLinker
 from second_brain.daemon.normalize import (
@@ -36,6 +35,7 @@ from second_brain.models import (
     LinkDecision,
     TopicAction,
 )
+from second_brain.openrouter_client import OpenRouterAPIError
 from second_brain.state import BrainStateStore
 
 # -- helpers -------------------------------------------------------------------
@@ -224,12 +224,12 @@ class TestNormalize:
 
 
 class TestExtract:
-    def test_build_messages_truncation(self) -> None:
-        long_body = "x" * 100_000  # ~25k tokens -> triggers truncation
+    def test_build_messages_does_not_truncate_long_sources(self) -> None:
+        long_body = "x" * 100_000  # ~25k tokens -> handled by extract orchestration
         msgs = build_messages(long_body, {})
         user_msg = msgs[1]["content"]
-        assert "[truncated for extraction" in user_msg
-        assert len(user_msg) < 70_000
+        assert "[truncated for extraction" not in user_msg
+        assert long_body in user_msg
 
     def test_schema_for_strict(self) -> None:
         schema = schema_for_strict()

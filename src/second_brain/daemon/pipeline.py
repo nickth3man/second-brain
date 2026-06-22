@@ -46,6 +46,7 @@ from second_brain.models import IngestStage, PageType, SourceState, TopicAction
 from second_brain.openrouter_client import (
     CreditExhaustedError,
     OpenRouterClient,
+    is_sensitive_path,
 )
 from second_brain.slug import slugify
 from second_brain.state import BrainStateStore, now_iso
@@ -192,6 +193,9 @@ async def ingest_file(
     source_id = source_id_for(path, preview, ingested)
 
     t_total = time.perf_counter()
+    old_sensitive_mode = getattr(client, "_sensitive_mode", False)
+    if is_sensitive_path(cfg, path):
+        client._sensitive_mode = True  # noqa: SLF001
 
     try:
         stage = route(path.suffix, cfg)
@@ -414,7 +418,11 @@ async def ingest_file(
         # Upsert the source's chunks before the per-decision loop
         if vec_store is not None and source_chunks and decisions:
             vec_store.upsert_source_chunks(
-                source_id, decisions[0].target_slug, source_chunks
+                source_id,
+                decisions[0].target_slug,
+                source_chunks,
+                source_hash=sha,
+                embedding_model=cfg.models.embedding,
             )
 
         # -- Phase 2.1: Near-duplicate detection (§11, passive surfacing) -
@@ -590,6 +598,8 @@ async def ingest_file(
             source_id=source_id, sha=sha, exc=e,
         )
         return IngestStage.FAILED
+    finally:
+        client._sensitive_mode = old_sensitive_mode  # noqa: SLF001
 
 
 def _deadletter(path: Path, cfg: Config) -> None:
@@ -639,6 +649,12 @@ async def run_daemon(cfg: Config) -> None:
             cfg.models.embedding,
             dim=dim,
         )
+        from second_brain.vectors.reconcile import reconcile_vector_index
+
+        report = await reconcile_vector_index(cfg, store, vec_store, embedder)
+        if report.changed:
+            store.save()
+            log.info("daemon.vector_reconciled", report=report.__dict__)
         linker: Linker = EmbeddingLinker(
             embedder, vec_store, cfg.ingestion.merge_threshold
         )

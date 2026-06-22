@@ -102,7 +102,7 @@ class TestParseText:
 
 
 class TestParseOffice:
-    """parse_office uses mammoth for docx-family, defers xlsx/pptx."""
+    """parse_office handles document, spreadsheet, and presentation formats."""
 
     async def test_docx_delegates_to_mammoth(self, tmp_path: Path, monkeypatch) -> None:
         from second_brain.parse.office import parse_office
@@ -131,23 +131,54 @@ class TestParseOffice:
         assert "Office parse failed" in result
         assert "corrupt file" in result
 
-    async def test_xlsx_returns_deferred_note(self, tmp_path: Path) -> None:
+    async def test_xlsx_converts_sheets_to_markdown_tables(self, tmp_path: Path) -> None:
+        from openpyxl import Workbook
+
         from second_brain.parse.office import parse_office
 
         p = tmp_path / "spreadsheet.xlsx"
-        p.write_bytes(b"fake xlsx")
-        result = await parse_office(p)
-        assert "not yet parsed" in result
-        assert ".xlsx" in result
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "People"
+        ws.append(["Name", "Role"])
+        ws.append(["Ada", "Engineer"])
+        empty = wb.create_sheet("Empty")
+        assert empty.max_row == 1
+        wb.save(p)
 
-    async def test_pptx_returns_deferred_note(self, tmp_path: Path) -> None:
+        result = await parse_office(p)
+        assert "## Sheet: People" in result
+        assert "| Name | Role |" in result
+        assert "| Ada | Engineer |" in result
+        assert "## Sheet: Empty" in result
+        assert "_Empty sheet._" in result
+
+    async def test_pptx_extracts_slide_text_and_notes(self, tmp_path: Path) -> None:
+        from pptx import Presentation
+
         from second_brain.parse.office import parse_office
 
         p = tmp_path / "slides.pptx"
-        p.write_bytes(b"fake pptx")
+        deck = Presentation()
+        slide = deck.slides.add_slide(deck.slide_layouts[1])
+        slide.shapes.title.text = "Roadmap"
+        slide.placeholders[1].text = "Build\nTest"
+        slide.notes_slide.notes_text_frame.text = "Mention rollout risk."
+        deck.save(p)
+
         result = await parse_office(p)
-        assert "not yet parsed" in result
-        assert ".pptx" in result
+        assert "## Slide 1: Roadmap" in result
+        assert "Build" in result
+        assert "### Speaker Notes" in result
+        assert "Mention rollout risk." in result
+
+    async def test_legacy_ppt_has_clear_unsupported_error(self, tmp_path: Path) -> None:
+        from second_brain.parse.office import parse_office
+
+        p = tmp_path / "slides.ppt"
+        p.write_bytes(b"fake ppt")
+        result = await parse_office(p)
+        assert "legacy .ppt parsing unsupported" in result
 
 
 # -- TestParseWeb -------------------------------------------------------------

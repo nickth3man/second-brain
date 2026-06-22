@@ -204,9 +204,12 @@ class VectorStore:
                 source_id   TEXT NOT NULL,
                 topic_slug  TEXT,
                 chunk_idx   INTEGER NOT NULL,
-                text        TEXT NOT NULL
+                text        TEXT NOT NULL,
+                source_hash TEXT,
+                embedding_model TEXT
             )
         """)
+        self._ensure_source_meta_columns()
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS topic_centroids_meta (
                 slug            TEXT PRIMARY KEY,
@@ -230,6 +233,16 @@ class VectorStore:
                 ts          TEXT NOT NULL
             )
         """)
+
+    def _ensure_source_meta_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.db.execute("PRAGMA table_info(source_chunks_meta)").fetchall()
+        }
+        if "source_hash" not in columns:
+            self.db.execute("ALTER TABLE source_chunks_meta ADD COLUMN source_hash TEXT")
+        if "embedding_model" not in columns:
+            self.db.execute("ALTER TABLE source_chunks_meta ADD COLUMN embedding_model TEXT")
 
     def _register_model(self, model: str, dim: int) -> None:
         """Register an embedding model as active, deactivating all others."""
@@ -258,6 +271,9 @@ class VectorStore:
         source_id: str,
         topic_slug: str,
         chunks: list[tuple[str, list[float]]],
+        *,
+        source_hash: str | None = None,
+        embedding_model: str | None = None,
     ) -> list[int]:
         """Insert or overwrite all chunks for a source in one transaction.
 
@@ -280,9 +296,17 @@ class VectorStore:
                 rowids.append(rowid)
                 self.db.execute(
                     "INSERT INTO source_chunks_meta "
-                    "(rowid, source_id, topic_slug, chunk_idx, text) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (rowid, source_id, topic_slug, i, text),
+                    "(rowid, source_id, topic_slug, chunk_idx, text, source_hash, embedding_model) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        rowid,
+                        source_id,
+                        topic_slug,
+                        i,
+                        text,
+                        source_hash,
+                        embedding_model or self.model,
+                    ),
                 )
                 self.db.execute(
                     "INSERT INTO source_chunks_fts "

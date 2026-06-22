@@ -84,6 +84,12 @@ vision_max_edge_px = 2048
 # Soft cap on audio/video length (minutes) before warning about cost/time.
 max_audio_minutes = 120
 
+# Optional video keyframe vision. Audio/STT remains primary; this samples a
+# bounded number of frames and sends each through [models].vision with ZDR.
+video_keyframe_vision = true
+video_keyframe_cadence_seconds = 120
+video_keyframe_max_frames = 8
+
 # ----------------------------------------------------------------------------
 # Compaction pass (§8) — scheduled global merge of similar topics.
 # ----------------------------------------------------------------------------
@@ -156,11 +162,13 @@ quarantine_dir = ".brain/quarantine"
 # ----------------------------------------------------------------------------
 [eval]
 # L0 structural invariants + L1 heuristics run every ingest (free, code-only).
-# Below: the 3 headline metrics, sampled. L2-L4 deferred until ~50+ sources.
+# L2 self-consistency runs offline. L3 LLM judge is opt-in via
+# SECOND_BRAIN_RUN_LLM_EVALS=1 and must use a cross-family judge model. L4 uses
+# cached golden-set artifacts when this directory is populated.
 sample_chat_faithfulness = 0.05     # fraction of chat answers judged (RAGAS)
 sample_merge_reversibility = 0.05   # fraction of merges checked for info loss
 cost_alert_daily_usd = 5.0          # health-panel alert if daily spend exceeds
-golden_set_dir = ".brain/golden"    # populated later (L4); empty for now
+golden_set_dir = ".brain/golden"    # optional cached golden cases for L4
 
 # ----------------------------------------------------------------------------
 # Versioning (§12.8) — git the brain

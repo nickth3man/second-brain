@@ -1,6 +1,6 @@
 """Configuration loader — reads config.toml into typed pydantic models.
 
-Uses stdlib tomllib (Python 3.11+). Mirrors every section/field in config.toml
+Uses stdlib tomllib (Python 3.12+). Mirrors every section/field in config.toml
 exactly. See §9 of ARCHITECTURE.md.
 """
 
@@ -37,6 +37,9 @@ class IngestionCfg(BaseModel):
     vision_max_images_per_request: int
     vision_max_edge_px: int
     max_audio_minutes: int
+    video_keyframe_vision: bool = True
+    video_keyframe_cadence_seconds: int = 120
+    video_keyframe_max_frames: int = 8
 
 
 class CompactionCfg(BaseModel):

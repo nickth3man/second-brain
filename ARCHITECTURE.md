@@ -5,8 +5,8 @@
 > **Edits made by the user to this file are authoritative architectural decisions**
 > and override prior conversation.
 
-**Status:** Design + reliability research complete · Tracks 1–8 + §12 locked · ready to build
-**Last updated:** 2026-06-19 14:50 EDT
+**Status:** MVP phases 0–6 implemented; architecture hardening and compliance pass in progress.
+**Last updated:** 2026-06-22
 
 ---
 
@@ -56,9 +56,9 @@ links, and summarizes it into a living wiki. Value compounds over time.
 
 | Layer            | Choice                                              | Notes                                                                  |
 | ---------------- | --------------------------------------------------- | ---------------------------------------------------------------------- |
-| Language         | **Python** (3.11+)                                  | Assumed — see [Open Assumptions](#11-open-assumptions)                 |
+| Language         | **Python** (3.12+)                                  | Locked by user decision; implemented in `pyproject.toml` |
 | LLM backend      | **OpenRouter** (single API for all model calls)     | text, vision, embeddings, STT all via OpenRouter                       |
-| PDF → image      | **PyMuPDF** (`pip install pymupdf`)                  | AGPL-3.0 (personal use OK); zero system deps; fastest                  |
+| PDF → image      | **PyMuPDF** (`pip install pymupdf`)                  | AGPL-3.0; acceptable because this project is open source               |
 | File watcher     | `watchdog`                                          | triggers the daemon on `00-inbox/` events                              |
 | Config           | TOML (`config.toml`)                                | all models + params swappable for testing                              |
 | Vector store     | Local — embeddings cached in `.brain/`              | via OpenRouter embeddings endpoint (no local model needed)             |
@@ -337,8 +337,8 @@ CONSTRAINTS:
 | Plain text   | `.md` `.txt` `.markdown` `.rst`            | Passthrough (+ optional light cleanup)            | —            |
 | PDF          | `.pdf`                                     | PyMuPDF render → vision OCR (one page per request)| Vision       |
 | Images       | `.png` `.jpg` `.jpeg` `.webp` `.gif` ...   | Vision: describe + OCR                            | Vision       |
-| Office docs  | `.docx` `.odt` `.rtf` `.pptx` ...          | Parse → markdown (mammoth / MarkItDown)           | —            |
-| Spreadsheets | `.xlsx` `.csv`                             | Sheets → markdown tables                          | —            |
+| Office docs  | `.docx` `.odt` `.rtf` `.pptx` ...          | Parse → markdown (mammoth / python-pptx)          | —            |
+| Spreadsheets | `.xlsx` `.csv`                             | Sheets → markdown tables (visible cached values)  | —            |
 | Web          | `.html` `.htm`                             | Readability extract → markdown                    | —            |
 | Ebooks       | `.epub`                                    | Unzip XHTML → markdown                            | —            |
 | Code         | `.py` `.js` `.ts` `.go` `.rs` ...          | Raw code + AI summary                             | Text LLM     |
@@ -363,7 +363,22 @@ CONSTRAINTS:
 - **One page per request** — OpenRouter vision caps 8 images/request; sequential
   sending also matches the synchronous pipeline.
 - Prompt includes page number ("page 3 of 12") for layout faithfulness.
-- License: **AGPL-3.0** — fine for personal/local; swap to `pypdfium2` (Apache-2.0) if ever distributed.
+- License: **AGPL-3.0** — accepted for this open-source project. If a future
+  closed-source binary/SaaS distribution is created, swap to `pypdfium2`
+  (Apache-2.0) first.
+
+### Office, Spreadsheet, and Presentation details
+
+- `.xlsx` is parsed with `openpyxl` in `data_only=True` mode, so formulas are
+  not executed; only cached visible values already stored in the workbook are
+  emitted. Each sheet becomes a markdown heading plus a table, and empty sheets
+  are represented explicitly.
+- `.pptx` is parsed with `python-pptx`; slide text is ordered by top/left
+  position where practical, slide numbers/headings are included, and speaker
+  notes are emitted when present.
+- Legacy binary `.xls` and `.ppt` are intentionally unsupported without an
+  optional legacy converter; ingestion emits a clear unsupported-format error
+  instead of a fake deferred note.
 
 ---
 
@@ -395,7 +410,8 @@ NEW SOURCE
 
 - **Naming:** AI proposes the human name; app derives the slug. (Track 4-1a)
 - **Merge threshold:** rerank similarity **≥ 0.70** merges; below spawns new. (Track 4-2a)
-- **Tags:** none. (Track 4-3a)
+- **Tags:** lightweight AI-emitted wiki metadata. Track 8-1b supersedes the earlier
+  Track 4-3a MVP simplification ("no tags").
 - **Autonomy:** fully autonomous, no overrides. (Track 4-4b) Escape hatch = rebuild.
 - **Backlinks:** `[[wikilinks]]` parsed and stored as graph edges in `state.json`
   (enables "what links here?" — nearly free since AI already emits links).
@@ -518,11 +534,10 @@ a [[Mythril bar]] prototype.   ← "Mythril bar" has no page -> red link
 ```
 → *The Tourist Trap* and *Anvil* render blue; *Mythril bar* renders red with a create-link.
 
-> **lib-2 also proposed page-structure refinements** (YAML `tags:`, `type:` + auto
-> infobox, `aliases:` for redirects, a computed `## See also` backlinks section,
-> breadcrumbs). Several EXTEND or CONFLICT with locked tracks — most importantly
-> `tags:` vs Track 4-3a ("no tags"). These are surfaced as a decision batch in
-> [§12](#12-pending-design), NOT yet applied to §4.2.
+> **lib-2 page-structure refinements adopted by Track 8:** YAML `tags:`, `type:`
+> + auto infobox, `aliases:` redirects, computed `## See also` backlinks, and
+> breadcrumbs are now part of §4.2/§4.6/§10. Track 8-1b supersedes the earlier
+> Track 4-3a MVP simplification ("no tags").
 
 ---
 
@@ -544,7 +559,10 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 ### Decisions (Track 7)
 1. **Source dedup — exact + semantic.** (7-1a) Exact `sha256` match → skip ingest
    silently. Near-duplicate (embedding cosine ≥ 0.95) → ingest, cross-link to the
-   existing source, badge as near-duplicate.
+   existing source, badge as near-duplicate. Batch near-dup scans use a
+   deterministic LSH pre-filter at 1000+ sources to avoid O(n²) full comparisons
+   during normal scale operation; per-source ingest uses existing source
+   centroids/cached embeddings.
 2. **Surfacing — web UI health panel, passive.** (7-2a) Orphans, stale topics,
    low-confidence items, duplicates shown as non-blocking badges. Never a review
    queue (honors §7 full autonomy).
@@ -578,7 +596,11 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 - Mechanism: `response_format: json_schema strict` (Pydantic `model_json_schema()`) + OpenRouter **`response-healing`** plugin (free, 80%+ JSON-defect reduction) + `provider.require_parameters: true` + Pydantic **`extra="forbid"`** + `model_validate_json()`.
 - **Schema stays static** — never bake the topic list into the schema as an enum (kills the grammar cache, hits param caps). Topic-matching stays in the embedding layer (§7).
 - Retry: model-fallback × retry double loop; retry **only** 429/5xx/connection; 4xx → next model; refusal/max_tokens → dead-letter. Dead-letters → `.brain/deadletter/`; all-low-confidence → `.brain/quarantine/`. **Never** write a partial `LibrarianOutput` to the wiki.
-- Long sources: <16K tok stuff; 16K–200K map-reduce (800-tok chunks, 100 overlap); 200K+ RAPTOR hierarchical.
+- Long sources: <16K tokens direct extraction; 16K–200K map-reduce
+  (approximately 800-token chunks, 100-token overlap) with an explicit
+  schema-validated reduce pass; 200K+ RAPTOR-style hierarchical summarization
+  builds deterministic chunk-summary trees with traceability back to original
+  chunks. No truncation/deferred path may write partial output.
 
 ### 12.3 Daemon & ingestion robustness  *(lib-5)*
 - **Stable-file gate:** `on_moved` is first-class (PyCharm/VSCode/Word emit it, not `on_modified`); ignore temp-file regex (`~$*`, `.goutputstream`, `.crdownload`, `.part`, `.swp`); stable = exists + size>0 + exclusive-open succeeds + size/mtime unchanged across two polls.
@@ -586,7 +608,11 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 - **Atomic writes:** same-dir `NamedTemporaryFile` + `flush` + `fsync` + `os.replace` (validate-before-replace). Win32-aware: `os.replace` not `os.rename`; may fall back to copy → **backups are mandatory**, not optional.
 - **Per-page PDF checkpoint** via `.brain/cache/<sha>.progress.json` sidecar → a failed 200-page PDF resumes from page 151, not page 1.
 - **OpenRouter failures:** tenacity + honor `Retry-After`; **402 (credit exhaustion) stops the daemon** + health-panel alert.
-- **Startup-reconcile pass** = mandatory self-healing (state↔filesystem both directions); promotes the "rebuild valve" to continuous per-source repair.
+- **Startup-reconcile pass** = mandatory self-healing (state↔filesystem both
+  directions plus vector/index drift repair). It detects and repairs missing,
+  orphan, and stale source embeddings; FTS mirror drift; missing/stale topic
+  centroids; topic membership drift; and tombstone inconsistencies while
+  preserving the daemon single-writer boundary.
 
 ### 12.4 Web UI & agent stack  *(lib-6)*
 - Stack: **FastAPI ≥0.135** (native `EventSourceResponse`) + Jinja2 + **HTMX 2** (`htmx-ext-sse`) + **mistune 3** (~35-line custom wikilink plugin) + **Pydantic AI** (`run_stream_events()`). **No SPA, no build step.**
@@ -600,7 +626,11 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
   - **L0 structural invariants** (code, free, every ingest): orphans, broken links, dupes, empty extractions, schema violations.
   - **L1 heuristics** (code, free, every ingest): citation format, hash stability, embedding drift, topic↔source cosine.
   - **3 headline metrics (sampled):** `mean_faithfulness_7d` (RAGAS, per chat) · `merge_reversibility_pass_rate_7d` (per compaction) · `cost_per_active_source_7d`.
-  - L2–L4 (self-consistency, full LLM-as-judge, golden-set regression) **deferred** until ~50+ sources.
+  - L2–L4 (self-consistency, full LLM-as-judge, golden-set regression) are
+    implemented as persisted eval artifacts. L2 is offline/deterministic; L3
+    LLM judge is opt-in via environment/config and enforces a cross-family judge;
+    L4 consumes cached golden-set fixtures and skips honestly when the set is
+    absent.
 - **Judge model must be cross-family** (e.g. Claude generates, GPT judges) — same-family judges rate their own output ~10–15% high (the `judge` slot, decision 2a).
 - **Tracing:** extend `.brain/changelog.jsonl` with `kind` (ingest|merge|chat|compact|eval|judge) + `trace_id`/`span_id`/`parent_span_id` + per-event `usage`/`scores`/`manifest`. No separate observability backend.
 - **Cost/caching:** `session_id` per compaction/chat run (prompt-cache sticky routing); OpenRouter **response-cache** (`X-OpenRouter-Cache`) for golden runs (zero-cost after first); embedding cache keyed on `(model, sha256, text)`. Caps: per-call `max_tokens`, per-run counter, OpenRouter dashboard hard cap.
@@ -609,15 +639,22 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 - **Atomic writes + backups:** rolling 3-deep (`state.json`/`.bak`/`.bak-1`/`.bak-2`) + daily `.brain/snapshots/` + load-time pydantic recovery (primary→bak→bak-1→rebuild). Single-writer in-process lock (no file lock).
 - **`schema_version`** in BOTH front-matter and `state.json` root; pydantic `model_validator(mode="before")` transparent in-load migration; historical migrations kept as tested code forever; **in-place for syntactic renames, rebuild for semantic changes.**
 - **`brain rebuild`** command: `--from-sources` (fast, re-runs link, ~\$0.08/1k) · `--from-inbox` (deep, re-runs extract, ~\$2–5/1k) · `--dry-run`; implicit backup to `.brain/snapshots/pre-rebuild-<ts>/`; **atomic-delete-then-rebuild** (crash leaves a complete prior state); idempotent. Always preserves `00-inbox/`, `config.toml`, `changelog.jsonl`, git history.
-- **Embedding swap = blue/green:** audit → shadow eval → build `.brain/embeddings.new/` → atomic dir-swap + `state.json` update (model + dim + per-source `embedding_model`) → validate vs cached test set → **rollback if >10% worse**; never overwrite in place; `embedding_swap_in_progress` flag for crash-resume.
+- **Embedding swap = blue/green:** audit → cached shadow eval test-set →
+  build `.brain/embeddings.new/` → atomic dir-swap + `state.json` update
+  (model + dim + per-source `embedding_model`) → validate vs cached test set →
+  **rollback if >10% worse**; never overwrite in place;
+  `embedding_swap_in_progress` flag for crash-resume. Eval manifests are written
+  under `.brain/evals/`.
 
 ### 12.7 Privacy & security — OpenRouter-only  *(lib-9, decision 5no)*
-- **`provider.zdr: true` on EVERY request** (stronger than `data_collection: deny` — ZDR filters retention, not just training). Account-level ZDR toggles on first run (`brain init`).
+- **`provider.zdr: true` on EVERY request** (stronger than `data_collection: deny` — ZDR filters retention, not just training). `brain init` checks the documented OpenRouter request-level ZDR preview endpoint when available, but does not claim account-level dashboard toggles are verified unless OpenRouter exposes reliable account metadata; otherwise they remain manually confirmed/unconfirmed.
 - **STT swap (2a):** `whisper-1` has **no ZDR endpoint** → default `stt = "openai/whisper-large-v3"` via `provider.only: ["groq","together"]` (ZDR). *(user may override in config.toml)*
 - **No PII redaction** (destroys extraction quality); `00-inbox/sensitive/` path flag → strictest ZDR routing. **5no = no local-model fallback** — sensitive media routes to ZDR cloud, not on-box. Accepted threat model: ZDR permits RAM caching; first-party retention terms vary by provider.
 - **API key:** Windows Credential Manager via `keyring` (DPAPI); `brain init` writes it; resolved keyring → env → config. *(user may paste directly in config as fallback)*
 - **STT resumability (3a):** **ffmpeg + chunked STT** (resumable per-chunk; adds ffmpeg dep + minor boundary artifacts).
-- **Licensing:** stay **PyMuPDF** (AGPL) for personal/open-source; PDF render wrapped behind a `pdf.render()` interface so the AGPL→pypdfium2(Apache) swap is mechanical if ever **conveyed** (binary/installer/multi-tenant SaaS = the real trigger).
+- **Licensing:** stay **PyMuPDF** (AGPL) for this open-source project; PDF render
+  wrapped behind a `pdf.render()` interface so an AGPL→pypdfium2(Apache) swap is
+  mechanical if a future closed-source/binary/SaaS distribution requires it.
 - **Hardening:** FastAPI bound to **127.0.0.1 only**; sqlite-vec chosen over ChromaDB (CVE-2026-45829).
 
 ### 12.8 Versioning — git  *(decision 6a, amended for privacy policy)*
@@ -631,27 +668,34 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 
 ---
 
-## 13. Pending Design
+## 13. Implementation Status
 
-- **Implementation phases** — design + reliability research complete (Tracks 1–8 + §12). Build in MVP-first phases:
-  - **0. Scaffold** — config loader, OpenRouter client, `keyring`, folder init.
-  - **1. Text-only ingestion loop** — watcher → `50-sources/` → extract → `90-wiki/` → `INDEX.md`. **The critical thin slice that proves the core loop.**
-  - **2. Linking & embeddings** — sqlite-vec, 0.70 merge, `state.json` graph, hybrid retrieval.
-  - **3. Multimodal** — PDF (PyMuPDF→vision), images, ffmpeg-chunked STT.
-  - **4. Compaction & health** — scheduled pass, dedup, eval L0/L1 + 3 metrics, health panel.
-  - **5. Web UI** — FastAPI + HTMX + mistune, wikilinks, infobox, `## See also`.
-  - **6. Chat** — Pydantic AI agentic RAG, streaming + visible thinking/tool-calls.
+- **Implementation phases** — MVP phases 0–6 have code and tests in this repo:
+  - **0. Scaffold** — implemented: config loader, OpenRouter client, `keyring`, folder init.
+  - **1. Text-only ingestion loop** — implemented and tested.
+  - **2. Linking & embeddings** — implemented with sqlite-vec, graph state, hybrid retrieval.
+  - **3. Multimodal** — implemented: PDF/image/office/web/ebook/audio/video
+    routing and parsers, including `.xlsx`, `.pptx`, and optional video
+    keyframe vision.
+  - **4. Compaction & health** — implemented with L0/L1 metrics, offline L2,
+    opt-in L3 judge, L4 golden-set orchestration, scale-ready source near-dup
+    prefiltering, and startup vector/index reconcile.
+  - **5. Web UI** — implemented with FastAPI + HTMX + mistune rendering.
+  - **6. Chat** — implemented with read-only streaming agent events.
+- **Compliance posture** — §12 hardening items are verified continuously by
+  code/tests; provider-backed evals remain opt-in to keep normal test runs
+  deterministic and offline.
 
 ---
 
 ## 14. Open Assumptions
 
-> **OPEN items still need your confirmation.** Everything else is a locked decision.
+> No open assumptions remain as of 2026-06-22. Everything below is a locked decision.
 
 | Item                        | Value                                  | Status                              |
 | --------------------------- | -------------------------------------- | ----------------------------------- |
-| Language                    | Python 3.11+                           | **OPEN — confirm** (signal: toml, ML ecosystem) |
-| PDF renderer license        | PyMuPDF (AGPL), personal use; wrapped behind `pdf.render()` iface | **OPEN — confirm** (swap to pypdfium2/Apache if conveyed as binary/SaaS) |
+| Language                    | Python 3.12+                           | Decided; implemented in tooling |
+| PDF renderer license        | PyMuPDF (AGPL), open-source project; wrapped behind `pdf.render()` iface | Decided; compatible with current open-source intent |
 | Interface                   | Web UI (FastAPI + Jinja2 + HTMX + mistune + Pydantic AI) | Decided (6-1c, §12.4)          |
 | Query write-back            | Read-only                              | Decided (Track 6-4c)                |
 | Compaction trigger          | daily OR every 25 sources              | Decided (Track 5-2a), adjustable    |
@@ -668,7 +712,7 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 | Text model                  | bumped `claude-3.5-sonnet` → `claude-sonnet-4.5` (structured outputs) | Decided (Block B-2a) |
 | Models config               | `[models]` slots: text/vision/embedding/stt/**chat/judge** (user fills preferred + key) | Decided (Block B-2a) |
 | STT                         | `whisper-large-v3` via Groq/Toaster (ZDR); ffmpeg-chunked for resumability | Decided (Block B-2a/3a) |
-| Eval scope                  | MVP slice: L0+L1 every ingest + 3 sampled metrics; L2–L4 deferred | Decided (Block B-4a) |
+| Eval scope                  | MVP slice plus production-scale L2–L4 required before broad 100–2000+ source use | Decided (updated 2026-06-22) |
 | Privacy                     | `provider.zdr:true` everywhere; no redaction; OpenRouter-only (no local fallback) | Decided (Block B-5no) |
 | Versioning                  | git the brain; `00-inbox/` ignored     | Decided (Block B-6a)                |
 

@@ -37,6 +37,20 @@ def now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_wikilinks(body: str) -> list[str]:
+    """Return slug-like targets from simple [[wikilinks]] in markdown body."""
+    import re
+
+    targets: list[str] = []
+    for raw in re.findall(r"\[\[([^\]]+)\]\]", body):
+        page = raw.split("|", 1)[0].split("#", 1)[0].strip()
+        slug = page.lower().replace("_", "-").replace(" ", "-")
+        slug = re.sub(r"[^a-z0-9-]+", "", slug).strip("-")
+        if slug:
+            targets.append(slug)
+    return targets
+
+
 # -- BrainStateStore ----------------------------------------------------------
 
 
@@ -262,7 +276,7 @@ def reconcile_filesystem(cfg: Any, store: BrainStateStore) -> bool:
         if source_id in store.state.sources:
             continue
         try:
-            meta, _body = split_frontmatter(path.read_text(encoding="utf-8"))
+            meta, body = split_frontmatter(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         store.state.sources[source_id] = SourceState(
@@ -293,7 +307,7 @@ def reconcile_filesystem(cfg: Any, store: BrainStateStore) -> bool:
         if slug in store.state.topics:
             continue
         try:
-            meta, _body = split_frontmatter(path.read_text(encoding="utf-8"))
+            meta, body = split_frontmatter(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         raw_type = str(meta.get("type", "concept")).lower()
@@ -311,13 +325,29 @@ def reconcile_filesystem(cfg: Any, store: BrainStateStore) -> bool:
                 for source_id, src in store.state.sources.items()
                 if slug in src.topics
             ],
-            links_to=list(meta.get("related", []) or []),
+            links_to=sorted(set(list(meta.get("related", []) or []) + _parse_wikilinks(body))),
             linked_from=[],
             confidence=float(meta.get("confidence", 0.0) or 0.0),
             created=str(meta.get("created", "")),
             updated=str(meta.get("updated", "")),
         )
         changed = True
+
+    for _slug, topic in store.state.topics.items():
+        topic.sources = [sid for sid in topic.sources if sid in store.state.sources]
+        refreshed_links = [target for target in topic.links_to if target in store.state.topics]
+        if refreshed_links != topic.links_to:
+            topic.links_to = refreshed_links
+            changed = True
+        topic.linked_from = []
+
+    for source_id, src in store.state.sources.items():
+        src.topics = [slug for slug in src.topics if slug in store.state.topics]
+        for slug in src.topics:
+            topic = store.state.topics.get(slug)
+            if topic is not None and source_id not in topic.sources:
+                topic.sources.append(source_id)
+                changed = True
 
     for slug, topic in store.state.topics.items():
         for target in topic.links_to:

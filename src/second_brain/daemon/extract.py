@@ -1,16 +1,15 @@
 """Structured extraction via LLM — Librarian output with JSON schema (§12.2).
 
 Defines the system prompt, message builder, strict-JSON-schema wrapper, and
-the extract function with a single repair fallback.
-
-Phase 1 does **not** implement map-reduce or RAPTOR — one stuffed call + one
-repair call is the slice.
+the extract function with the long-source strategy from §12.2.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
+from dataclasses import dataclass, field
 
 import structlog
 from pydantic import ValidationError
@@ -23,6 +22,12 @@ from second_brain.openrouter_client import (
 )
 
 log = structlog.get_logger(__name__)
+
+DIRECT_TOKEN_LIMIT = 16_000
+MAP_REDUCE_TOKEN_LIMIT = 200_000
+MAP_CHUNK_TOKENS = 800
+MAP_CHUNK_OVERLAP_TOKENS = 100
+CHARS_PER_TOKEN = 4
 
 # -- prompt --------------------------------------------------------------------
 
@@ -96,6 +101,23 @@ class ConfidenceFloorError(Exception):
         )
 
 
+@dataclass(frozen=True)
+class ExtractionPlan:
+    strategy: str
+    chunks: list[str]
+
+
+@dataclass(frozen=True)
+class RaptorNode:
+    """A deterministic RAPTOR hierarchy node with source-chunk traceability."""
+
+    node_id: str
+    level: int
+    text: str
+    chunk_ids: tuple[int, ...]
+    children: tuple[RaptorNode, ...] = field(default_factory=tuple)
+
+
 # -- helpers -------------------------------------------------------------------
 
 
@@ -107,20 +129,11 @@ def build_messages(
 ) -> list[dict]:
     """Build the messages list for the librarian chat completion.
 
-    Truncates *source_body* if its estimated token count exceeds 16 000
-    (§12.2: map-reduce deferred in Phase 1).
-
     Args:
         source_type: If ``"structured"``, uses the structured-data prompt
             (exactly ONE topic). Otherwise uses the default librarian prompt
             (3–7 topics).
     """
-    if estimate_tokens(source_body) > 16000:
-        source_body = (
-            source_body[:64000]
-            + "\n\n[truncated for extraction — map-reduce deferred §12.2]"
-        )
-
     prompt = (
         STRUCTURED_SYSTEM_PROMPT
         if source_type == "structured"
@@ -138,6 +151,186 @@ def build_messages(
         {"role": "system", "content": prompt},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
+
+
+def chunk_for_extraction(
+    source_body: str,
+    *,
+    chunk_tokens: int = MAP_CHUNK_TOKENS,
+    overlap_tokens: int = MAP_CHUNK_OVERLAP_TOKENS,
+) -> list[str]:
+    """Chunk text into approximate token windows for map-reduce extraction."""
+    if not source_body:
+        return []
+    size = chunk_tokens * CHARS_PER_TOKEN
+    overlap = overlap_tokens * CHARS_PER_TOKEN
+    step = size - overlap
+    if step <= 0:
+        raise ValueError("overlap_tokens must be smaller than chunk_tokens")
+    chunks: list[str] = []
+    start = 0
+    while start < len(source_body):
+        end = min(start + size, len(source_body))
+        chunks.append(source_body[start:end])
+        if end == len(source_body):
+            break
+        start += step
+    return chunks
+
+
+def build_raptor_tree(
+    chunk_summaries: list[str],
+    *,
+    group_size: int = 6,
+    context_token_budget: int = DIRECT_TOKEN_LIMIT,
+) -> RaptorNode:
+    """Build a deterministic RAPTOR-style summary tree.
+
+    The tree clusters related summaries by stable lexical signatures, groups
+    them into bounded parent nodes, and preserves every original chunk id in
+    each ancestor. This pure function is intentionally LLM-free so hierarchy
+    shape and traceability are unit-testable.
+    """
+    if not chunk_summaries:
+        raise ExtractionError("raptor tree requires at least one chunk summary")
+    if group_size < 2:
+        raise ValueError("group_size must be >= 2")
+
+    nodes = [
+        RaptorNode(
+            node_id=f"L0-C{idx}",
+            level=0,
+            text=summary,
+            chunk_ids=(idx,),
+        )
+        for idx, summary in enumerate(chunk_summaries)
+    ]
+    level = 0
+    while len(nodes) > 1 and (
+        sum(estimate_tokens(node.text) for node in nodes) > context_token_budget
+        or level == 0
+    ):
+        level += 1
+        nodes = _cluster_raptor_nodes(nodes, level=level, group_size=group_size)
+    return RaptorNode(
+        node_id=f"L{level + 1}-ROOT",
+        level=level + 1,
+        text="\n\n".join(node.text for node in nodes),
+        chunk_ids=tuple(chunk for node in nodes for chunk in node.chunk_ids),
+        children=tuple(nodes),
+    )
+
+
+def _cluster_raptor_nodes(
+    nodes: list[RaptorNode],
+    *,
+    level: int,
+    group_size: int,
+) -> list[RaptorNode]:
+    buckets: dict[str, list[RaptorNode]] = {}
+    for node in nodes:
+        buckets.setdefault(_summary_signature(node.text), []).append(node)
+
+    parents: list[RaptorNode] = []
+    for signature in sorted(buckets):
+        bucket = buckets[signature]
+        bucket.sort(key=lambda node: node.chunk_ids)
+        for start in range(0, len(bucket), group_size):
+            group = bucket[start:start + group_size]
+            chunk_ids = tuple(chunk for child in group for chunk in child.chunk_ids)
+            parent_text = _parent_summary_text(signature, group)
+            parents.append(
+                RaptorNode(
+                    node_id=f"L{level}-N{len(parents)}",
+                    level=level,
+                    text=parent_text,
+                    chunk_ids=chunk_ids,
+                    children=tuple(group),
+                )
+            )
+    parents.sort(key=lambda node: node.chunk_ids)
+    return parents
+
+
+def _summary_signature(text: str) -> str:
+    words = [
+        word
+        for word in re.findall(r"[a-z0-9]{4,}", text.lower())
+        if word not in {"this", "that", "with", "from", "source", "chunk", "summary"}
+    ]
+    return words[0] if words else "misc"
+
+
+def _parent_summary_text(signature: str, children: list[RaptorNode]) -> str:
+    traces = ", ".join(f"chunk {idx}" for child in children for idx in child.chunk_ids)
+    body = "\n".join(f"- {child.text}" for child in children)
+    return f"Cluster: {signature}\nTrace: {traces}\n{body}"
+
+
+def plan_extraction(source_body: str) -> ExtractionPlan:
+    """Return direct, map-reduce, or raptor-style extraction plan (§12.2)."""
+    token_count = estimate_tokens(source_body)
+    if token_count < DIRECT_TOKEN_LIMIT:
+        return ExtractionPlan("direct", [source_body])
+    chunks = chunk_for_extraction(source_body)
+    if token_count < MAP_REDUCE_TOKEN_LIMIT:
+        return ExtractionPlan("map_reduce", chunks)
+    return ExtractionPlan("raptor", chunks)
+
+
+def _merge_outputs(outputs: list[LibrarianOutput], *, strategy: str) -> LibrarianOutput:
+    """Deterministically reduce chunk-level LibrarianOutput objects."""
+    if not outputs:
+        raise ExtractionError(f"{strategy} extraction produced no chunk outputs")
+    seen: set[tuple[str, str]] = set()
+    topics = []
+    for out in outputs:
+        for topic in out.topics:
+            key = (topic.name.lower(), topic.target_slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            topics.append(topic)
+            if len(topics) >= 7:
+                break
+        if len(topics) >= 7:
+            break
+    tldr = " ".join(out.tldr.strip() for out in outputs if out.tldr.strip())
+    if not topics:
+        raise ExtractionError(f"{strategy} extraction returned zero topics")
+    return LibrarianOutput(tldr=tldr[:2000], topics=topics)
+
+
+def _outputs_to_reduce_markdown(outputs: list[LibrarianOutput], *, label: str) -> str:
+    sections = [
+        f"{label}\n\n"
+        "Reduce these structured chunk summaries into one valid librarian output."
+    ]
+    for idx, out in enumerate(outputs, 1):
+        sections.append(
+            "## Mapped Summary "
+            f"{idx}\nTrace: chunk {idx - 1}\n"
+            f"TLDR: {out.tldr}\n"
+            + "\n".join(
+                (
+                    f"- Topic: {topic.name}\n"
+                    f"  Confidence: {topic.confidence}\n"
+                    f"  Section: {topic.merged_section}"
+                )
+                for topic in out.topics
+            )
+        )
+    return "\n\n".join(sections)
+
+
+def _raptor_final_markdown(root: RaptorNode) -> str:
+    return (
+        "RAPTOR FINAL REDUCE\n\n"
+        "Use the hierarchical summaries below. Preserve claims only when they "
+        "are supported by traced chunks.\n\n"
+        f"Root trace chunks: {', '.join(str(idx) for idx in root.chunk_ids)}\n\n"
+        f"{root.text}"
+    )
 
 
 def schema_for_strict() -> dict:
@@ -223,7 +416,7 @@ async def extract(
         )
         log.info("extract.attempt.end", **end_kw)
 
-    async def _try(model_name: str, attempt_n: int) -> LibrarianOutput:
+    async def _try_body(model_name: str, attempt_n: int, body: str) -> LibrarianOutput:
         log.info(
             "extract.attempt.start",
             source_id=source_id,
@@ -232,7 +425,7 @@ async def extract(
             attempt=attempt_n,
         )
         t0 = time.perf_counter()
-        messages = build_messages(source_body, existing_titles, source_type=source_type)
+        messages = build_messages(body, existing_titles, source_type=source_type)
         resp = await client.chat_completion(
             model_name,
             messages,
@@ -265,6 +458,37 @@ async def extract(
                     floor=floor,
                 )
         return out
+
+    async def _try(model_name: str, attempt_n: int) -> LibrarianOutput:
+        plan = plan_extraction(source_body)
+        if plan.strategy == "direct":
+            return await _try_body(model_name, attempt_n, plan.chunks[0])
+
+        log.info(
+            "extract.long_source.start",
+            source_id=source_id,
+            strategy=plan.strategy,
+            chunks=len(plan.chunks),
+        )
+        outputs: list[LibrarianOutput] = []
+        for idx, chunk in enumerate(plan.chunks, 1):
+            wrapped = (
+                f"LONG SOURCE {plan.strategy.upper()} MAP CHUNK {idx}/{len(plan.chunks)}\n\n"
+                f"{chunk}"
+            )
+            outputs.append(await _try_body(model_name, attempt_n, wrapped))
+
+        if plan.strategy == "map_reduce":
+            reduce_body = _outputs_to_reduce_markdown(
+                outputs,
+                label="MAP-REDUCE REDUCE PASS",
+            )
+            return await _try_body(model_name, attempt_n, reduce_body)
+
+        raptor_root = build_raptor_tree(
+            [_outputs_to_reduce_markdown([out], label="RAPTOR LEAF SUMMARY") for out in outputs]
+        )
+        return await _try_body(model_name, attempt_n, _raptor_final_markdown(raptor_root))
 
     primary_error_type = "Unknown"
 

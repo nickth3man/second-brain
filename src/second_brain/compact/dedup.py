@@ -3,11 +3,8 @@
 Pairs of sources whose embedding cosine >= threshold are surfaced for
 manual review.  No auto-merge — surfacing is passive (§11 7-2a).
 
-Scalability TODO
-----------------
-The current implementation is O(n^2) over sources, which is fine for MVP
-(<1k sources).  For larger brains, a locality-sensitive hashing (LSH)
-pre-filter should be added.
+For larger brains this uses a deterministic SimHash-style LSH pre-filter so
+normal compaction does not compare every pair at 1000+ source scale.
 
 References
 ----------
@@ -21,6 +18,9 @@ import hashlib
 import math
 
 import numpy as np
+
+LSH_SOURCE_THRESHOLD = 1000
+LSH_PLANES = 16
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -80,16 +80,50 @@ async def find_near_duplicates(
     for sid in valid:
         embeddings[sid] = await embedder.embed_one(texts[sid])
 
-    # Pairwise comparison.
+    if len(valid) >= LSH_SOURCE_THRESHOLD:
+        candidates = _lsh_candidate_pairs(valid, embeddings)
+    else:
+        candidates = (
+            (valid[i], valid[j])
+            for i in range(len(valid))
+            for j in range(i + 1, len(valid))
+        )
+
     pairs: list[tuple[str, str, float]] = []
-    for i in range(len(valid)):
-        for j in range(i + 1, len(valid)):
-            a, b = valid[i], valid[j]
-            sim = cosine(embeddings[a], embeddings[b])
-            if sim >= threshold:
-                pairs.append((a, b, sim))
+    for a, b in candidates:
+        sim = cosine(embeddings[a], embeddings[b])
+        if sim >= threshold:
+            pairs.append((a, b, sim))
 
     pairs.sort(key=lambda x: x[2], reverse=True)
+    return pairs
+
+
+def _lsh_candidate_pairs(
+    source_ids: list[str],
+    embeddings: dict[str, list[float]],
+) -> set[tuple[str, str]]:
+    """Return candidate pairs from deterministic random-hyperplane buckets."""
+    dim = len(next(iter(embeddings.values())))
+    rng = np.random.default_rng(17)
+    planes = rng.normal(size=(LSH_PLANES, dim))
+    buckets: dict[str, list[str]] = {}
+    for sid in source_ids:
+        vec = np.array(embeddings[sid], dtype=np.float64)
+        bits = "".join("1" if float(np.dot(vec, plane)) >= 0 else "0" for plane in planes)
+        # Prefix buckets improve recall for very similar vectors that cross one
+        # late hyperplane while keeping candidate sets bounded.
+        for width in (8, 12, 16):
+            buckets.setdefault(bits[:width], []).append(sid)
+
+    pairs: set[tuple[str, str]] = set()
+    for bucket in buckets.values():
+        if len(bucket) < 2:
+            continue
+        for i in range(len(bucket)):
+            for j in range(i + 1, len(bucket)):
+                a, b = sorted((bucket[i], bucket[j]))
+                pairs.add((a, b))
     return pairs
 
 
