@@ -17,6 +17,7 @@ import structlog
 from pydantic import ValidationError
 
 from second_brain.atomicio import rolling_backup, write_json_atomic
+from second_brain.frontmatter import split_frontmatter
 from second_brain.models import BrainState, IngestStage, PageType, SourceState, TopicState
 
 log = structlog.get_logger(__name__)
@@ -229,3 +230,108 @@ class BrainStateStore:
             f.write(line)
             f.flush()
             os.fsync(f.fileno())
+
+
+def reconcile_filesystem(cfg: Any, store: BrainStateStore) -> bool:
+    """Reconcile ``state.json`` with derived source/wiki files (§12.3).
+
+    The pass is intentionally conservative: it restores missing state entries
+    from valid front-matter in ``50-sources`` and ``90-wiki``, and removes
+    state entries whose derived files no longer exist. Raw inbox files are
+    never changed.
+
+    Returns:
+        ``True`` when state changed and was saved.
+    """
+    changed = False
+    root = cfg.brain_root
+
+    source_dir = root / "50-sources"
+    source_files = {
+        path.stem: path
+        for path in source_dir.glob("*.md")
+        if path.is_file() and path.name != ".gitkeep"
+    } if source_dir.exists() else {}
+
+    for source_id in list(store.state.sources):
+        if source_id not in source_files:
+            del store.state.sources[source_id]
+            changed = True
+
+    for source_id, path in source_files.items():
+        if source_id in store.state.sources:
+            continue
+        try:
+            meta, _body = split_frontmatter(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        store.state.sources[source_id] = SourceState(
+            sha256=str(meta.get("sha256", "")),
+            topics=list(meta.get("topics", []) or []),
+            raw=str(meta.get("source", "")),
+            embedding_model=meta.get("embedding_model"),
+            stage=IngestStage.DONE,
+            tokens=int(meta.get("tokens", 0) or 0),
+            type=str(meta.get("type", "text")),
+            ingested=str(meta.get("ingested", "")),
+        )
+        changed = True
+
+    wiki_dir = root / "90-wiki"
+    wiki_files = {
+        path.stem: path
+        for path in wiki_dir.glob("*.md")
+        if path.is_file() and path.name != ".gitkeep"
+    } if wiki_dir.exists() else {}
+
+    for slug in list(store.state.topics):
+        if slug not in wiki_files:
+            del store.state.topics[slug]
+            changed = True
+
+    for slug, path in wiki_files.items():
+        if slug in store.state.topics:
+            continue
+        try:
+            meta, _body = split_frontmatter(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw_type = str(meta.get("type", "concept")).lower()
+        try:
+            page_type = PageType(raw_type)
+        except ValueError:
+            page_type = PageType.CONCEPT
+        store.state.topics[slug] = TopicState(
+            title=str(meta.get("title", slug)),
+            type=page_type,
+            tags=list(meta.get("tags", []) or []),
+            aliases=list(meta.get("aliases", []) or []),
+            sources=[
+                source_id
+                for source_id, src in store.state.sources.items()
+                if slug in src.topics
+            ],
+            links_to=list(meta.get("related", []) or []),
+            linked_from=[],
+            confidence=float(meta.get("confidence", 0.0) or 0.0),
+            created=str(meta.get("created", "")),
+            updated=str(meta.get("updated", "")),
+        )
+        changed = True
+
+    for slug, topic in store.state.topics.items():
+        for target in topic.links_to:
+            linked = store.state.topics.get(target)
+            if linked is not None and slug not in linked.linked_from:
+                linked.linked_from.append(slug)
+                changed = True
+
+    if changed:
+        store.state.updated = now_iso()
+        store.save()
+        log.info(
+            "state_reconciled",
+            sources=len(store.state.sources),
+            topics=len(store.state.topics),
+        )
+    return changed

@@ -46,6 +46,7 @@ def write_new_topic(
     tldr = _derive_tldr(decision.merged_section)
 
     meta = {
+        "schema_version": 1,
         "title": title,
         "slug": slug,
         "type": "concept",
@@ -123,6 +124,7 @@ def merge_into_topic(
         )
 
     # Update front-matter
+    meta.setdefault("schema_version", 1)
     meta["updated"] = dt
     existing_count = int(meta.get("source_count", 0))
     new_count = existing_count + 1

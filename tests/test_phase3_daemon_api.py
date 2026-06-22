@@ -7,7 +7,6 @@ writeable VectorStore; everyone else goes through this loopback HTTP API.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -155,20 +154,14 @@ class TestDaemonApi:
 
 
 class TestChatAgentSearchFn:
-    """The chat agent's search_fn parameter (the remote-search path)."""
+    """The chat agent streams native tool events from the §12.4 agent loop."""
 
-    async def test_chat_stream_with_search_fn(self, tmp_path: Path) -> None:
-        """When search_fn is provided, the agent uses it instead of vec_store."""
+    async def test_chat_stream_with_agent_tool_events(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Agent tool events are bridged to the app SSE schema."""
+        import second_brain.chat.agent as chat_agent
         from second_brain.chat import chat_stream
-
-        class FakeStreamClient:
-            async def chat_completion_stream(
-                self, model, messages, *, extra_body=None
-            ) -> AsyncIterator[dict[str, Any]]:
-                yield {"reasoning": None, "content": "Answer."}
-
-            async def close(self) -> None:
-                pass
 
         async def _search_fn(query: str, k: int) -> list[dict]:
             return [
@@ -180,8 +173,30 @@ class TestChatAgentSearchFn:
                 }
             ]
 
+        async def _fake_stream(agent, query, cfg):
+            hits = await _search_fn(query, 5)
+            yield {"type": "thinking", "content": "Starting agent loop..."}
+            yield {"type": "tool_call", "tool": "search_brain", "args": {"query": query, "k": 5}}
+            yield {
+                "type": "tool_result",
+                "tool": "search_brain",
+                "hits": [
+                    {
+                        "source_id": h["source_id"],
+                        "topic_slug": h["topic_slug"],
+                        "score": h["score"],
+                        "snippet": h["text"],
+                    }
+                    for h in hits
+                ],
+            }
+            yield {"type": "answer_delta", "content": "Answer."}
+            yield {"type": "done"}
+
         cfg = SimpleNamespace(models=SimpleNamespace(chat="test-chat-model"))
         store = SimpleNamespace()
+        fake_agent = object()
+        monkeypatch.setattr(chat_agent, "_stream_pydantic_events", _fake_stream)
 
         events: list[dict[str, Any]] = []
         async for ev in chat_stream(
@@ -190,9 +205,10 @@ class TestChatAgentSearchFn:
             store,
             vec_store=None,
             embedder=None,
-            client=FakeStreamClient(),
+            client=None,
             k=5,
             search_fn=_search_fn,
+            agent=fake_agent,
         ):
             events.append(ev)
 
@@ -207,25 +223,33 @@ class TestChatAgentSearchFn:
         assert types[-1] == "done"
 
     async def test_chat_stream_search_fn_error_handled(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When search_fn raises, tool_result has error + empty hits (no crash)."""
+        """Tool errors are exposed as tool_result error events."""
+        import second_brain.chat.agent as chat_agent
         from second_brain.chat import chat_stream
-
-        class FakeStreamClient:
-            async def chat_completion_stream(
-                self, model, messages, *, extra_body=None
-            ) -> AsyncIterator[dict[str, Any]]:
-                yield {"reasoning": None, "content": "answer"}
-
-            async def close(self) -> None:
-                pass
 
         async def _broken_search(query: str, k: int) -> list[dict]:
             msg = "daemon 503"
             raise RuntimeError(msg)
 
+        async def _fake_stream(agent, query, cfg):
+            yield {"type": "thinking", "content": "Starting agent loop..."}
+            yield {"type": "tool_call", "tool": "search_brain", "args": {"query": query, "k": 5}}
+            try:
+                await _broken_search(query, 5)
+            except RuntimeError as exc:
+                yield {
+                    "type": "tool_result",
+                    "tool": "search_brain",
+                    "hits": [],
+                    "error": str(exc),
+                }
+            yield {"type": "answer_delta", "content": "answer"}
+            yield {"type": "done"}
+
         cfg = SimpleNamespace(models=SimpleNamespace(chat="m"))
+        monkeypatch.setattr(chat_agent, "_stream_pydantic_events", _fake_stream)
         events: list[dict[str, Any]] = []
         async for ev in chat_stream(
             "q",
@@ -233,9 +257,10 @@ class TestChatAgentSearchFn:
             SimpleNamespace(),
             vec_store=None,
             embedder=None,
-            client=FakeStreamClient(),
+            client=None,
             k=5,
             search_fn=_broken_search,
+            agent=object(),
         ):
             events.append(ev)
 

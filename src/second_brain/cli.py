@@ -186,10 +186,7 @@ def search(
     """Search the brain using hybrid retrieval (Phase 2)."""
 
     async def _search() -> None:
-        from second_brain.openrouter_client import OpenRouterClient
-        from second_brain.vectors.embed import Embedder
-        from second_brain.vectors.retrieval import SearchHit, search_brain
-        from second_brain.vectors.store import VectorStore
+        from second_brain.state import BrainStateStore
 
         cfg = load_config()
 
@@ -209,30 +206,21 @@ def search(
                 )
             return
 
-        # Standalone fallback: open a local writeable VectorStore.
-        client = OpenRouterClient(cfg)
-        embedder = Embedder(client, cfg)
-        dim = await embedder.ensure_dim()
-        vec_store = VectorStore(
-            cfg.brain_root / ".brain/embeddings.db",
-            cfg.models.embedding,
-            dim=dim,
-        )
-        try:
-            hits: list[SearchHit] = await search_brain(query, vec_store, embedder, k=5)
-            if not hits:
-                typer.echo("No results.")
-                return
-            for i, hit in enumerate(hits, 1):
-                snippet = hit.text[:120].replace("\n", " ")
-                typer.echo(
-                    f"{i}. [{hit.source_id}] "
-                    f"(topic={hit.topic_slug}, score={hit.score:.4f})\n"
-                    f"   {snippet}\n"
-                )
-        finally:
-            vec_store.close()
-            await client.close()
+        # Query commands are read-only (§10). If the daemon is down, do not
+        # open sqlite locally in write mode; degrade to title matches.
+        q_lower = query.lower()
+        store = BrainStateStore.load(cfg)
+        matches = [
+            (slug, topic.title)
+            for slug, topic in store.state.topics.items()
+            if q_lower in topic.title.lower()
+        ]
+        if not matches:
+            typer.echo("Semantic search unavailable (daemon not running). No title matches.")
+            return
+        typer.echo("Semantic search unavailable (daemon not running). Showing title matches.")
+        for i, (slug, title) in enumerate(sorted(matches), 1):
+            typer.echo(f"{i}. {title} (topic={slug})")
 
     asyncio.run(_search())
 
@@ -295,7 +283,7 @@ def rebuild(
                 plan = await rebuild_from_inbox(cfg, client, dry_run=dry_run)
         except RuntimeError as e:
             typer.echo(f"Rebuild failed: {e}")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from e
         finally:
             await client.close()
 
@@ -434,8 +422,6 @@ def ask(
         from second_brain.chat import chat_stream
         from second_brain.openrouter_client import OpenRouterClient
         from second_brain.state import BrainStateStore
-        from second_brain.vectors.embed import Embedder
-        from second_brain.vectors.store import VectorStore
 
         def _emit(event: dict) -> None:
             t = event["type"]
@@ -495,21 +481,20 @@ def ask(
                     _emit(event)
                 return
 
-            # Standalone fallback: open a local writeable VectorStore.
-            embedder = Embedder(client, cfg)
-            dim = await embedder.ensure_dim()
-            vec_store = VectorStore(
-                cfg.brain_root / ".brain/embeddings.db",
-                cfg.models.embedding,
-                dim=dim,
-            )
-            try:
-                async for event in chat_stream(
-                    query, cfg, store, vec_store, embedder, client, k=8
-                ):
-                    _emit(event)
-            finally:
-                vec_store.close()
+            async def _empty_search_fn(q: str, k: int) -> list[dict]:  # noqa: ARG001
+                return []
+
+            async for event in chat_stream(
+                query,
+                cfg,
+                store,
+                vec_store=None,
+                embedder=None,
+                client=client,
+                k=8,
+                search_fn=_empty_search_fn,
+            ):
+                _emit(event)
         finally:
             await client.close()
 

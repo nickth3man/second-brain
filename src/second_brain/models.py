@@ -10,8 +10,9 @@ See §4 (Data Formats), §4.4 (state.json), §4.6 (page types), §5 (pipeline),
 from __future__ import annotations
 
 from enum import StrEnum, auto
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 # -- StrEnum helpers ----------------------------------------------------------
 
@@ -58,6 +59,7 @@ class SourceMeta(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: int = 1
     source: str
     type: str
     ingested: str
@@ -150,3 +152,20 @@ class BrainState(BaseModel):
     # ``state.json`` files loadable (backward compat via ``extra="ignore"``).
     last_compaction_ts: str = ""        # ISO 8601 of last compaction run
     sources_since_compaction: int = 0   # counter, reset on compaction
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate(cls, data: Any) -> Any:
+        """Transparent in-load migration hook (§12.6).
+
+        Version 1 migration is intentionally small: old state files without a
+        root schema marker are treated as v1, and the old ``last_updated`` key
+        is accepted as ``updated`` when present.
+        """
+        if not isinstance(data, dict):
+            return data
+        migrated = dict(data)
+        migrated.setdefault("schema_version", 1)
+        if "updated" not in migrated and "last_updated" in migrated:
+            migrated["updated"] = migrated["last_updated"]
+        return migrated

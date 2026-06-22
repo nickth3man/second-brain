@@ -18,14 +18,14 @@ from __future__ import annotations
 
 import os
 import shutil
+from copy import copy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import structlog
 from pydantic import BaseModel
 
-from second_brain.atomicio import write_atomic, write_json_atomic
+from second_brain.atomicio import write_atomic
 from second_brain.config import Config
 from second_brain.daemon.index import DebouncedIndex
 from second_brain.daemon.linker import EmbeddingLinker
@@ -33,7 +33,6 @@ from second_brain.daemon.pipeline import ingest_file
 from second_brain.frontmatter import dump_frontmatter, split_frontmatter
 from second_brain.models import BrainState, PageType, SourceState, TopicState
 from second_brain.openrouter_client import OpenRouterClient
-from second_brain.slug import slugify
 from second_brain.state import BrainStateStore, now_iso
 from second_brain.vectors.embed import Embedder
 from second_brain.vectors.store import VectorStore, chunk_text
@@ -41,6 +40,7 @@ from second_brain.vectors.store import VectorStore, chunk_text
 log = structlog.get_logger(__name__)
 
 SNAPSHOT_DIR_PREFIX = "pre-rebuild-"
+REBUILD_WORK_DIR = ".brain/rebuild-work"
 
 
 class RebuildPlan(BaseModel):
@@ -64,6 +64,40 @@ def _replace_tree(src: Path, dst: Path) -> None:
         shutil.rmtree(dst)
     if src.exists() and any(src.iterdir()):
         shutil.copytree(src, dst)
+
+
+def _cfg_with_root(cfg: Config, root: Path):
+    """Return a shallow config clone whose ``brain_root`` points at *root*."""
+    staged = copy(cfg)
+    staged.brain_root = root
+    return staged
+
+
+def _fresh_work_root(cfg: Config, ts: str, mode: str) -> Path:
+    """Create an empty rebuild staging root under ``.brain/rebuild-work``."""
+    root = cfg.brain_root / REBUILD_WORK_DIR / f"{mode}-{ts}"
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _swap_tree(staged: Path, live: Path, rollback: Path) -> None:
+    """Swap a fully-built staged directory into place, retaining rollback."""
+    if rollback.exists():
+        shutil.rmtree(rollback)
+    if live.exists():
+        os.replace(live, rollback)
+    os.replace(staged, live)
+
+
+def _swap_file(staged: Path, live: Path, rollback: Path) -> None:
+    """Swap a staged file into place, retaining rollback when one exists."""
+    if rollback.exists():
+        rollback.unlink()
+    if live.exists():
+        os.replace(live, rollback)
+    os.replace(staged, live)
 
 
 def _snapshot_rebuild_state(cfg: Config, ts: str) -> Path:
@@ -107,7 +141,10 @@ def _rotate_pre_rebuild_snapshots(cfg: Config, keep: int = 3) -> None:
         return
 
     dirs = sorted(
-        [d for d in snapshots_root.iterdir() if d.is_dir() and d.name.startswith(SNAPSHOT_DIR_PREFIX)],
+        [
+            d for d in snapshots_root.iterdir()
+            if d.is_dir() and d.name.startswith(SNAPSHOT_DIR_PREFIX)
+        ],
         key=lambda d: d.name,
     )
     to_remove = dirs[:-keep] if keep > 0 and len(dirs) > keep else (dirs if keep == 0 else [])
@@ -164,10 +201,7 @@ def _extract_section(body: str, heading: str) -> str:
     else:
         start = pos + len(marker)
     next_heading = body.find("\n## ", start)
-    if next_heading < 0:
-        raw = body[start:]
-    else:
-        raw = body[start:next_heading]
+    raw = body[start:] if next_heading < 0 else body[start:next_heading]
     return raw.strip("\n")
 
 
@@ -241,7 +275,7 @@ def _build_fresh_state_from_sources(
     fresh_state = BrainState()
     source_id_to_topics: dict[str, list[str]] = {}
 
-    for path, meta, body, topics in valid_sources:
+    for path, _meta, _body, topics in valid_sources:
         source_id = path.stem
         source_id_to_topics[source_id] = topics
 
@@ -295,7 +329,7 @@ def _build_fresh_state_from_sources(
                 fresh_state.topics[target].linked_from.append(slug)
 
     # Build source registry from existing state (preserves sha256, raw, etc.).
-    for path, meta, body, topics in valid_sources:
+    for path, meta, _body, topics in valid_sources:
         source_id = path.stem
         old = store.state.sources.get(source_id)
         raw = meta.get("source") or (old.raw if old else "")
@@ -325,6 +359,7 @@ def _write_wiki_from_state(
     *,
     synthesis_by_slug: dict[str, str] | None = None,
     open_questions_by_slug: dict[str, str] | None = None,
+    output_root: Path | None = None,
 ) -> None:
     """Write fresh ``90-wiki/*.md`` pages from the rebuilt state.
 
@@ -400,6 +435,7 @@ def _write_wiki_from_state(
         )
 
         meta = {
+            "schema_version": 1,
             "title": topic.title,
             "slug": slug,
             "type": topic.type.value.lower(),
@@ -413,7 +449,7 @@ def _write_wiki_from_state(
         }
 
         write_atomic(
-            cfg.brain_root / "90-wiki" / f"{slug}.md",
+            (output_root or cfg.brain_root) / "90-wiki" / f"{slug}.md",
             dump_frontmatter(meta, page_body),
         )
 
@@ -498,31 +534,25 @@ async def rebuild_from_sources(
             open_questions_by_slug[slug] = ""
 
     rebuild_db = cfg.brain_root / ".brain" / "embeddings.rebuild.db"
+    work_root = _fresh_work_root(cfg, ts, "from-sources")
+    work_cfg = _cfg_with_root(cfg, work_root)
     vec_store: VectorStore | None = None
     destructive_started = False
 
     try:
-        # -- destructive phase begins ---------------------------------------
-        destructive_started = True
-        # Remove old wiki pages so dropped topics leave no orphans.
-        wiki_dir = cfg.brain_root / "90-wiki"
-        if wiki_dir.exists():
-            shutil.rmtree(wiki_dir)
-        wiki_dir.mkdir(parents=True, exist_ok=True)
-        # Write fresh wiki pages from pre-captured synthesis.
+        # Build all replacement artifacts under the staging root first.
+        # The live derived tree remains intact until the commit phase.
+        (work_root / "90-wiki").mkdir(parents=True, exist_ok=True)
         _write_wiki_from_state(
             cfg, fresh_state, valid_sources, source_chunks,
             synthesis_by_slug=synthesis_by_slug,
             open_questions_by_slug=open_questions_by_slug,
+            output_root=work_root,
         )
 
-        # Write fresh state.json.
-        fresh_store = BrainStateStore(cfg)
+        fresh_store = BrainStateStore(work_cfg)
         fresh_store.state = fresh_state
-        fresh_store.save()
-        store = fresh_store
 
-        # Build fresh vector store.
         if rebuild_db.exists():
             rebuild_db.unlink()
         vec_store = VectorStore(rebuild_db, cfg.models.embedding, dim=embedder.dim)
@@ -543,13 +573,29 @@ async def rebuild_from_sources(
         vec_store.close()
         vec_store = None
 
-        # Atomic swap embeddings.db.
-        target_db = cfg.brain_root / ".brain" / "embeddings.db"
-        os.replace(rebuild_db, target_db)
-
-        # Regenerate INDEX.md.
-        index = DebouncedIndex(cfg, store)
+        index = DebouncedIndex(work_cfg, fresh_store)
         await index.flush_now()
+
+        # -- commit phase begins -------------------------------------------
+        destructive_started = True
+        rollback_root = cfg.brain_root / ".brain" / "rollback" / f"from-sources-{ts}"
+        rollback_root.mkdir(parents=True, exist_ok=True)
+
+        _swap_tree(
+            work_root / "90-wiki",
+            cfg.brain_root / "90-wiki",
+            rollback_root / "90-wiki",
+        )
+
+        target_db = cfg.brain_root / ".brain" / "embeddings.db"
+        _swap_file(rebuild_db, target_db, rollback_root / "embeddings.db")
+
+        _swap_file(work_root / "INDEX.md", cfg.brain_root / "INDEX.md", rollback_root / "INDEX.md")
+
+        fresh_store = BrainStateStore(cfg)
+        fresh_store.state = fresh_state
+        fresh_store.save()
+        store = fresh_store
 
         # Append changelog entry.
         store.append_changelog(
@@ -581,6 +627,8 @@ async def rebuild_from_sources(
     finally:
         if vec_store is not None:
             vec_store.close()
+        if work_root.exists():
+            shutil.rmtree(work_root, ignore_errors=True)
 
 
 # -- from-inbox rebuild ------------------------------------------------------
@@ -627,41 +675,35 @@ async def rebuild_from_inbox(
     store = BrainStateStore.load(cfg)
     topics_before = len(store.state.topics)
 
-    rebuild_db = cfg.brain_root / ".brain" / "embeddings.rebuild.db"
+    work_root = _fresh_work_root(cfg, ts, "from-inbox")
+    work_cfg = _cfg_with_root(cfg, work_root)
     vec_store: VectorStore | None = None
     destructive_started = False
 
     try:
-        # -- destructive phase begins ---------------------------------------
-        destructive_started = True
-        sources_dir = cfg.brain_root / "50-sources"
-        wiki_dir = cfg.brain_root / "90-wiki"
-        brain_dir = cfg.brain_root / ".brain"
+        # Build the deep rebuild under a staging root first. The live inbox is
+        # copied read-only into staging so generated front-matter still points
+        # at ``00-inbox/<name>`` while the live derived tree remains intact.
+        for dirname in ("00-inbox", "50-sources", "90-wiki", ".brain"):
+            (work_root / dirname).mkdir(parents=True, exist_ok=True)
+        staged_inbox_files: list[Path] = []
+        for path in inbox_files:
+            dst = work_root / "00-inbox" / path.name
+            shutil.copy2(path, dst)
+            staged_inbox_files.append(dst)
 
-        if sources_dir.exists():
-            shutil.rmtree(sources_dir)
-        sources_dir.mkdir(parents=True, exist_ok=True)
-        if wiki_dir.exists():
-            shutil.rmtree(wiki_dir)
-        wiki_dir.mkdir(parents=True, exist_ok=True)
-        for p in (brain_dir / "state.json", brain_dir / "embeddings.db"):
-            if p.exists():
-                p.unlink()
-
-        # Fresh stores.
-        store = BrainStateStore.load(cfg)  # empty because we deleted state.json
-        embedder = Embedder(client, cfg)
+        store = BrainStateStore.load(work_cfg)
+        embedder = Embedder(client, work_cfg)
         await embedder.ensure_dim()
-        if rebuild_db.exists():
-            rebuild_db.unlink()
+        rebuild_db = work_root / ".brain" / "embeddings.db"
         vec_store = VectorStore(rebuild_db, cfg.models.embedding, dim=embedder.dim)
         linker = EmbeddingLinker(embedder, vec_store, cfg.ingestion.merge_threshold)
-        index = DebouncedIndex(cfg, store)
+        index = DebouncedIndex(work_cfg, store)
 
-        for path in inbox_files:
+        for path in staged_inbox_files:
             await ingest_file(
                 path,
-                cfg,
+                work_cfg,
                 store,
                 client,
                 linker,
@@ -672,14 +714,32 @@ async def rebuild_from_inbox(
 
         await index.flush_now()
 
-        # Atomic swap embeddings.db.
-        target_db = brain_dir / "embeddings.db"
         vec_store.close()
         vec_store = None
-        os.replace(rebuild_db, target_db)
 
-        # Save final state.
-        store.save()
+        # -- commit phase begins -------------------------------------------
+        destructive_started = True
+        rollback_root = cfg.brain_root / ".brain" / "rollback" / f"from-inbox-{ts}"
+        rollback_root.mkdir(parents=True, exist_ok=True)
+        brain_dir = cfg.brain_root / ".brain"
+
+        _swap_tree(
+            work_root / "50-sources",
+            cfg.brain_root / "50-sources",
+            rollback_root / "50-sources",
+        )
+        _swap_tree(
+            work_root / "90-wiki",
+            cfg.brain_root / "90-wiki",
+            rollback_root / "90-wiki",
+        )
+        _swap_file(work_root / "INDEX.md", cfg.brain_root / "INDEX.md", rollback_root / "INDEX.md")
+        _swap_file(rebuild_db, brain_dir / "embeddings.db", rollback_root / "embeddings.db")
+
+        live_store = BrainStateStore(cfg)
+        live_store.state = store.state
+        live_store.save()
+        store = live_store
 
         topics_after = len(store.state.topics)
 
@@ -712,3 +772,5 @@ async def rebuild_from_inbox(
     finally:
         if vec_store is not None:
             vec_store.close()
+        if work_root.exists():
+            shutil.rmtree(work_root, ignore_errors=True)

@@ -24,9 +24,10 @@ dependencies = [
     "readability-lxml",
     "mistune>=3",
     "jinja2>=3",
-    "fastapi",
+    "fastapi>=0.135",
     "uvicorn[standard]",
     "python-multipart",
+    "pydantic-ai",
 ]
 
 [project.optional-dependencies]

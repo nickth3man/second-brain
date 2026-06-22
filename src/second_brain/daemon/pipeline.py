@@ -256,7 +256,7 @@ async def ingest_file(
                 if src_path.exists():
                     src_text = src_path.read_text(encoding="utf-8")
                     src_text = src_text.replace(sentinel, "").rstrip()
-                    src_path.write_text(src_text, encoding="utf-8")
+                    write_atomic(src_path, src_text)
             log.info(
                 "pipeline.partial",
                 source_id=source_id, sha=sha,
@@ -615,6 +615,9 @@ async def run_daemon(cfg: Config) -> None:
     _ = OpenRouterClient(cfg)  # resolves API key on first access
 
     store = BrainStateStore.load(cfg)
+    from second_brain.state import reconcile_filesystem
+
+    reconcile_filesystem(cfg, store)
     index = DebouncedIndex(cfg, store)
     queue: asyncio.Queue[Path] = asyncio.Queue()
     loop = asyncio.get_running_loop()
