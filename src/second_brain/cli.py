@@ -122,6 +122,34 @@ def _render_stage_table(progress: list[dict]) -> None:
             typer.echo(f"{stage:<12}{model:<30}{status:<7}{notes}")
 
 
+class _StreamingProgress(list):
+    """A list that prints each stage row to stdout as soon as it is appended.
+
+    The header is printed on the first append so the table appears immediately
+    rather than buffering until the pipeline finishes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._header_printed = False
+
+    def append(self, row: dict) -> None:  # type: ignore[override]
+        super().append(row)
+        if not self._header_printed:
+            typer.echo("")
+            typer.echo(f"{'Stage':<12}{'Model':<30}{'Status':<7}Notes")
+            typer.echo("-" * 60)
+            self._header_printed = True
+        stage = str(row.get("stage", ""))
+        model = row.get("model") or ""
+        status = str(row.get("status", ""))
+        notes = str(row.get("notes") or "").encode("ascii", errors="replace").decode("ascii")
+        try:
+            typer.echo(f"{stage:<12}{model:<30}{status:<7}{notes}")
+        except UnicodeEncodeError:
+            typer.echo(f"{stage:<12}{model:<30}{status:<7}")
+
+
 @app.command()
 def ingest(
     path: Annotated[
@@ -130,7 +158,7 @@ def ingest(
 ) -> None:
     """Ingest a single file (one-shot, without the watcher)."""
 
-    async def _ingest_one() -> tuple[str, list[dict]]:
+    async def _ingest_one() -> tuple[str, _StreamingProgress]:
         from second_brain.daemon.index import DebouncedIndex
         from second_brain.daemon.linker import EmbeddingLinker
         from second_brain.daemon.pipeline import ingest_file
@@ -155,7 +183,7 @@ def ingest(
         )
         index = DebouncedIndex(cfg, store)
         try:
-            progress: list[dict] = []
+            progress: _StreamingProgress = _StreamingProgress()
             stage = await ingest_file(
                 path, cfg, store, client, linker, index,
                 embedder=embedder, vec_store=vec_store,
@@ -167,14 +195,11 @@ def ingest(
             vec_store.close()
             await client.close()
 
-    stage, progress = asyncio.run(_ingest_one())
+    stage, _progress = asyncio.run(_ingest_one())
     try:
-        typer.echo(f"{path.name}: {stage}")
+        typer.echo(f"\n{path.name}: {stage}")
     except UnicodeEncodeError:
-        typer.echo(f"{path.name.encode('ascii', errors='replace').decode('ascii')}: {stage}")
-    if progress:
-        typer.echo("")
-        _render_stage_table(progress)
+        typer.echo(f"\n{path.name.encode('ascii', errors='replace').decode('ascii')}: {stage}")
 
 
 async def _daemon_search(
