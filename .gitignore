@@ -21,6 +21,13 @@
 # .brain/ golden — golden test set (populated later)
 .brain/golden/
 
+# .brain/ embedding swap temp dirs (§12.6 blue/green)
+.brain/embeddings.new/
+.brain/embeddings.rollback/
+
+# .brain/ eval artifacts — L1-L4 metrics (regenerable)
+.brain/evals/
+
 # .brain/ logs — rotating structured logs (observability, §12.7)
 .brain/logs/
 
