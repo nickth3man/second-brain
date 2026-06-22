@@ -6,7 +6,7 @@ Usage::
     brain watch     # start file-watcher daemon (Phase 1)
     brain ingest   # ingest one file (Phase 1/2)
     brain search   # hybrid search (Phase 2)
-    brain rebuild  # rebuild wiki (Phase 4)
+    brain rebuild  # rebuild wiki (Phase 5)
     brain compact  # run compaction pass (Phase 4)
     brain health   # run health check (Phase 4)
     brain ask      # interactive chat (Phase 6)
@@ -238,9 +238,77 @@ def search(
 
 
 @app.command()
-def rebuild() -> None:
-    """Rebuild wiki from sources or inbox (Phase 4)."""
-    typer.echo("Not yet implemented (Phase 4).")
+def rebuild(
+    from_sources: Annotated[
+        bool, typer.Option("--from-sources", help="Fast rebuild from 50-sources/ (re-link only).")
+    ] = False,
+    from_inbox: Annotated[
+        bool, typer.Option("--from-inbox", help="Deep rebuild from 00-inbox/ (re-extract).")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report what would be rebuilt; do not write.")
+    ] = False,
+) -> None:
+    """Rebuild the wiki from sources or inbox (Phase 5 — §12.6 escape hatch)."""
+
+    async def _rebuild() -> None:
+        import httpx
+
+        from second_brain.openrouter_client import OpenRouterClient
+        from second_brain.rebuild import rebuild_from_inbox, rebuild_from_sources
+
+        cfg = load_config()
+        configure_logging(cfg.brain_root)
+
+        # Validate exactly one of --from-sources / --from-inbox.
+        # xor: both-set or both-unset are invalid.
+        if from_sources == from_inbox:
+            typer.echo(
+                "Usage: brain rebuild --from-sources | --from-inbox "
+                "(exactly one required)."
+            )
+            raise typer.Exit(2)
+
+        # Daemon-running guard (§12.1 single-writer invariant).
+        try:
+            url = (
+                f"http://{cfg.daemon.http_host}:"
+                f"{cfg.daemon.http_port}/health"
+            )
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, connect=0.5)
+            ) as http:
+                await http.get(url)
+            typer.echo(
+                f"Daemon is running on port {cfg.daemon.http_port}; "
+                "stop it before rebuild (single-writer invariant, §12.1)."
+            )
+            raise typer.Exit(1)
+        except (httpx.ConnectError, httpx.TimeoutException):
+            pass  # Daemon is down — proceed.
+
+        client = OpenRouterClient(cfg)
+        try:
+            if from_sources:
+                plan = await rebuild_from_sources(cfg, client, dry_run=dry_run)
+            else:
+                plan = await rebuild_from_inbox(cfg, client, dry_run=dry_run)
+        except RuntimeError as e:
+            typer.echo(f"Rebuild failed: {e}")
+            raise typer.Exit(1)
+        finally:
+            await client.close()
+
+        typer.echo(f"Rebuild mode: {plan.mode}")
+        typer.echo(f"Dry run: {plan.dry_run}")
+        typer.echo(f"Sources seen: {plan.sources_seen}")
+        typer.echo(f"Sources skipped: {plan.sources_skipped}")
+        typer.echo(f"Topics before: {plan.topics_before}")
+        typer.echo(f"Topics after: {plan.topics_after}")
+        if plan.snapshot_dir:
+            typer.echo(f"Snapshot: {plan.snapshot_dir}")
+
+    asyncio.run(_rebuild())
 
 
 @app.command()
