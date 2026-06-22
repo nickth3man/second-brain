@@ -77,8 +77,7 @@ class OpenRouterAPIError(OpenRouterError):
 
 # -- STT retry constants -----------------------------------------------------
 
-_RETRYABLE_STATUSES: set[int] = {429, 500, 502, 503}
-MAX_STT_RETRIES = 3
+_RETRYABLE_STATUSES: set[int] = {429, 500, 502, 503, 504}
 
 # -- audio format mapping ---------------------------------------------------
 
@@ -268,14 +267,12 @@ class OpenRouterClient:
             # delta-seconds integer or an HTTP-date; we only honour the
             # integer form (the OpenRouter docs specify seconds).
             retry_after: int | None = None
-            try:
-                headers = getattr(resp, "headers", None)
-                if headers is not None:
-                    raw = headers.get("retry-after")
-                    if raw is not None and raw != "":
-                        retry_after = int(raw)
-            except (TypeError, ValueError, AttributeError):
-                retry_after = None
+            raw = resp.headers.get("retry-after")
+            if raw:
+                try:
+                    retry_after = int(raw)
+                except ValueError:
+                    retry_after = None
             log.error(
                 "openrouter.error",
                 endpoint=endpoint,
@@ -335,7 +332,7 @@ class OpenRouterClient:
         Retries on:
 
         - :class:`OpenRouterAPIError` whose ``status`` is in
-          ``{429, 500, 502, 503}``
+          ``{429, 500, 502, 503, 504}``
         - :class:`httpx.TimeoutException`
         - :class:`httpx.ConnectError`
 
@@ -473,10 +470,11 @@ class OpenRouterClient:
         rejects multipart with ``ZodError``.  ZDR is enforced via the
         ``provider`` sub-dict in the JSON body.
 
-        Retries on ``httpx.TimeoutException``, ``httpx.ConnectError``, or
-        ``OpenRouterAPIError`` with retryable status (429/500/502/503).
-        Non-retryable statuses (400/401/402/404) raise immediately.
-        402 remains :class:`CreditExhaustedError`.
+        Retries via :meth:`_with_retry` on ``httpx.TimeoutException``,
+        ``httpx.ConnectError``, or ``OpenRouterAPIError`` with retryable
+        status (429/500/502/503/504).  Non-retryable statuses
+        (400/401/402/404) raise immediately.  402 remains
+        :class:`CreditExhaustedError`.
 
         Args:
             model: OpenRouter STT model slug.
@@ -515,44 +513,16 @@ class OpenRouterClient:
         if language is not None:
             body["language"] = language
 
-        def _is_retryable(exc: Exception) -> bool:
-            if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
-                return True
-            return (
-                isinstance(exc, OpenRouterAPIError)
-                and exc.status in _RETRYABLE_STATUSES
-            )
-
-        exp_jitter = tenacity.wait_exponential_jitter(initial=1, max=10)
-
-        def _wait(retry_state: tenacity.RetryCallState) -> float:
-            # §12.2 — honour server-supplied ``Retry-After`` (§12.2) when
-            # present, otherwise fall back to exponential backoff + jitter.
-            outcome = retry_state.outcome
-            if outcome is not None and outcome.failed:
-                exc = outcome.exception()
-                if (
-                    isinstance(exc, OpenRouterAPIError)
-                    and exc.retry_after is not None
-                    and exc.retry_after > 0
-                ):
-                    return float(exc.retry_after)
-            return exp_jitter(retry_state)
-
-        async for attempt in tenacity.AsyncRetrying(
-            stop=tenacity.stop_after_attempt(MAX_STT_RETRIES),
-            wait=_wait,
-            retry=tenacity.retry_if_exception(_is_retryable),
-            reraise=True,
-        ):
-            with attempt:
-                resp = await self._post(
-                    "/audio/transcriptions",
-                    body,
-                    model=model,
-                    req_meta={"audio_bytes": len(raw), "format": fmt},
-                )
-                return resp["text"]
+        resp = await self._with_retry(
+            lambda: self._post(
+                "/audio/transcriptions",
+                body,
+                model=model,
+                req_meta={"audio_bytes": len(raw), "format": fmt},
+            ),
+            model=model,
+        )
+        return resp["text"]
 
     async def chat_completion(
         self,

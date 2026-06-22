@@ -133,6 +133,7 @@ class TestOpenRouterObservability:
 
         mock_resp = MagicMock(spec=httpx.Response)
         mock_resp.status_code = 400
+        mock_resp.headers = {}
         mock_resp.text = '{"error":{"name":"ZodError","message":"bad request"}}'
         mock_resp.content = mock_resp.text.encode()
         mock_resp.json.return_value = {"error": {"name": "ZodError", "message": "bad request"}}

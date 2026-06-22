@@ -300,6 +300,7 @@ class TestTranscribeWireFormat:
         error_body = '{"error":{"name":"ZodError","message":"Validation failed"}}'
         mock_resp = MagicMock(spec=httpx.Response)
         mock_resp.status_code = 400
+        mock_resp.headers = {}
         mock_resp.text = error_body
         mock_resp.content = error_body.encode()
         mock_resp.json.return_value = {
@@ -322,6 +323,7 @@ class TestTranscribeWireFormat:
 
         mock_resp = MagicMock(spec=httpx.Response)
         mock_resp.status_code = 401
+        mock_resp.headers = {}
         mock_resp.text = '{"error":{"name":"Unauthorized"}}'
         mock_resp.content = mock_resp.text.encode()
         mock_resp.json.return_value = {"error": {"name": "Unauthorized"}}

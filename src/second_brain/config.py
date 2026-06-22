@@ -111,7 +111,7 @@ class Config(BaseModel):
     eval: EvalCfg
     git: GitCfg
     brain_root: Path
-    compaction: CompactionCfg | None = Field(default_factory=CompactionCfg)
+    compaction: CompactionCfg = Field(default_factory=CompactionCfg)
 
 
 # -- helpers -----------------------------------------------------------------
