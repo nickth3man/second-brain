@@ -84,6 +84,23 @@ def watch() -> None:
     asyncio.run(run_daemon(cfg))
 
 
+def _render_stage_table(progress: list[dict]) -> None:
+    """Render the compact per-stage table for ``brain ingest`` output.
+
+    Fixed-width columns: Stage (12) | Model (30) | Status (7) | Notes.
+    An empty ``model`` string renders as a blank cell (not ``None``).
+    Rows are printed in the order they appear in ``progress``.
+    """
+    typer.echo(f"{'Stage':<12}{'Model':<30}{'Status':<7}Notes")
+    typer.echo("-" * 60)
+    for row in progress:
+        stage = str(row.get("stage", ""))
+        model = row.get("model") or ""
+        status = str(row.get("status", ""))
+        notes = row.get("notes") or ""
+        typer.echo(f"{stage:<12}{model:<30}{status:<7}{notes}")
+
+
 @app.command()
 def ingest(
     path: Annotated[
@@ -92,7 +109,7 @@ def ingest(
 ) -> None:
     """Ingest a single file (one-shot, without the watcher)."""
 
-    async def _ingest_one() -> str:
+    async def _ingest_one() -> tuple[str, list[dict]]:
         from second_brain.daemon.index import DebouncedIndex
         from second_brain.daemon.linker import EmbeddingLinker
         from second_brain.daemon.pipeline import ingest_file
@@ -117,18 +134,23 @@ def ingest(
         )
         index = DebouncedIndex(cfg, store)
         try:
+            progress: list[dict] = []
             stage = await ingest_file(
                 path, cfg, store, client, linker, index,
                 embedder=embedder, vec_store=vec_store,
+                progress=progress,
             )
             await index.flush_now()
-            return str(stage)
+            return str(stage), progress
         finally:
             vec_store.close()
             await client.close()
 
-    stage = asyncio.run(_ingest_one())
+    stage, progress = asyncio.run(_ingest_one())
     typer.echo(f"{path.name}: {stage}")
+    if progress:
+        typer.echo("")
+        _render_stage_table(progress)
 
 
 @app.command()

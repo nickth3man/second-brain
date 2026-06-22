@@ -35,6 +35,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "mypy",
+    "uv",
 ]
 
 [project.scripts]

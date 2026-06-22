@@ -10,13 +10,17 @@ repair call is the slice.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
+import structlog
 from pydantic import ValidationError
 
 from second_brain.daemon.normalize import estimate_tokens
 from second_brain.models import LibrarianOutput
 from second_brain.openrouter_client import CreditExhaustedError
+
+log = structlog.get_logger(__name__)
 
 # -- prompt --------------------------------------------------------------------
 
@@ -72,6 +76,22 @@ CONSTRAINTS:
 
 class ExtractionError(Exception):
     """Extraction failed after all retry/fallback attempts."""
+
+
+class ConfidenceFloorError(Exception):
+    """Raised when ALL extracted topics fall below the configured confidence_floor.
+
+    Caught by the pipeline to quarantine the source. Per §12.2 — quarantine, no merge.
+    """
+
+    def __init__(self, source_id: str, n_topics: int, max_confidence: float, floor: float) -> None:
+        self.source_id = source_id
+        self.n_topics = n_topics
+        self.max_confidence = max_confidence
+        self.floor = floor
+        super().__init__(
+            f"all {n_topics} topics below confidence_floor={floor} (max={max_confidence})"
+        )
 
 
 # -- helpers -------------------------------------------------------------------
@@ -145,6 +165,7 @@ async def extract(
     existing_titles: dict[str, str],
     *,
     source_type: str | None = None,
+    source_id: str = "",
 ) -> LibrarianOutput:
     """Extract structured output from a source via the librarian LLM.
 
@@ -152,6 +173,9 @@ async def extract(
         source_type: If ``"structured"``, uses the structured-data prompt
             (exactly ONE topic). Otherwise uses the default librarian prompt
             (3–7 topics).
+        source_id: Optional caller-supplied source identifier used in
+            structured log events and stamped on :class:`ConfidenceFloorError`.
+            Defaults to ``""`` when the caller does not supply it.
 
     Attempts the **primary model** first, then falls back to the **repair
     model** on 5xx / parse errors.
@@ -159,6 +183,8 @@ async def extract(
     Raises:
         CreditExhaustedError: OpenRouter credit exhausted — stops the daemon.
         ExtractionError: both attempts failed.
+        ConfidenceFloorError: every returned topic is below
+            ``cfg.extraction.confidence_floor`` — pipeline quarantines.
         httpx.HTTPStatusError: a 4xx status (other than 402) — immediate
             abort, no fallback.
     """
@@ -169,8 +195,41 @@ async def extract(
     )
     model = cfg.extraction.primary_model or cfg.models.text
     repair_model = cfg.extraction.repair_model
+    floor = cfg.extraction.confidence_floor
 
-    async def _try(model_name: str) -> LibrarianOutput:
+    def _emit_end(model_name: str, attempt_n: int, out: LibrarianOutput, t0: float) -> None:
+        """Emit ``extract.attempt.end`` plus ``extract.attempt.empty`` when applicable."""
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        end_kw: dict[str, object] = {
+            "source_id": source_id,
+            "model": model_name,
+            "attempt": attempt_n,
+            "latency_ms": latency_ms,
+            "n_topics": len(out.topics),
+        }
+        if out.topics:
+            confs = [t.confidence for t in out.topics]
+            end_kw["confidence_min"] = round(min(confs), 4)
+            end_kw["confidence_max"] = round(max(confs), 4)
+            log.info("extract.attempt.end", **end_kw)
+            return
+        log.warning(
+            "extract.attempt.empty",
+            source_id=source_id,
+            model=model_name,
+            reason="zero_topics",
+        )
+        log.info("extract.attempt.end", **end_kw)
+
+    async def _try(model_name: str, attempt_n: int) -> LibrarianOutput:
+        log.info(
+            "extract.attempt.start",
+            source_id=source_id,
+            model=model_name,
+            source_type=source_type or "text",
+            attempt=attempt_n,
+        )
+        t0 = time.perf_counter()
         messages = build_messages(source_body, existing_titles, source_type=source_type)
         resp = await client.chat_completion(
             model_name,
@@ -182,23 +241,55 @@ async def extract(
         # Structured output (json_schema) is self-protecting: a leading
         # <think>...</think> would break JSON parse -> existing repair
         # fallback handles it. No need to strip here.
-        return LibrarianOutput.model_validate_json(content)
+        out = LibrarianOutput.model_validate_json(content)
+        _emit_end(model_name, attempt_n, out, t0)
+        # Confidence-floor enforcement — only when at least one topic exists.
+        # An empty topics list is a separate (existing) failure mode.
+        if out.topics:
+            max_conf = max(t.confidence for t in out.topics)
+            if max_conf < floor:
+                log.warning(
+                    "extract.confidence_floor.breached",
+                    source_id=source_id,
+                    n_topics=len(out.topics),
+                    max_confidence=round(max_conf, 4),
+                    confidence_floor=floor,
+                    model=model_name,
+                )
+                raise ConfidenceFloorError(
+                    source_id=source_id,
+                    n_topics=len(out.topics),
+                    max_confidence=max_conf,
+                    floor=floor,
+                )
+        return out
+
+    primary_error_type = "Unknown"
 
     # -- Primary attempt ------------------------------------------------
     try:
-        return await _try(model)
+        return await _try(model, 1)
     except CreditExhaustedError:
         raise
     except httpx.HTTPStatusError as e:
         if e.response.status_code < 500:  # 4xx (402 already caught above)
             raise  # immediate abort, no fallback
+        primary_error_type = type(e).__name__
         # 5xx -> fall through to repair
-    except (json.JSONDecodeError, ValidationError):
-        pass  # Parse error -> fallback
+    except (json.JSONDecodeError, ValidationError) as e:
+        primary_error_type = type(e).__name__
+        # Parse error -> fallback
 
     # -- Repair fallback -------------------------------------------------
+    log.warning(
+        "extract.repair_fallback",
+        source_id=source_id,
+        primary_model=model,
+        repair_model=repair_model,
+        error_type=primary_error_type,
+    )
     try:
-        return await _try(repair_model)
+        return await _try(repair_model, 2)
     except CreditExhaustedError:
         raise
     except (json.JSONDecodeError, ValidationError, httpx.HTTPStatusError) as e:

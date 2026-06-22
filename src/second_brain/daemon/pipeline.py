@@ -26,10 +26,11 @@ from pathlib import Path
 import structlog
 
 from second_brain.config import Config
-from second_brain.daemon.extract import ExtractionError, extract
+from second_brain.daemon.extract import ConfidenceFloorError, ExtractionError, extract
 from second_brain.daemon.index import DebouncedIndex
 from second_brain.daemon.linker import EmbeddingLinker, LinkContext, Linker
 from second_brain.daemon.normalize import (
+    estimate_tokens,
     normalize_text,
     sha256_of_file,
     source_id_for,
@@ -126,6 +127,7 @@ async def ingest_file(
     *,
     embedder: Embedder | None = None,
     vec_store: VectorStore | None = None,
+    progress: list[dict] | None = None,
 ) -> IngestStage:
     """Run the full ingestion pipeline (stages 1–6) on a single file.
 
@@ -144,7 +146,20 @@ async def ingest_file(
         store.append_changelog(
             {"kind": "ingest", "action": "dedup_skip", "sha": sha}
         )
+        if progress is not None:
+            progress.append(
+                {
+                    "stage": "hash",
+                    "model": "",
+                    "status": "ok",
+                    "notes": f"dedup_skip {sha[:12]}",
+                }
+            )
         return IngestStage.DONE
+    if progress is not None:
+        progress.append(
+            {"stage": "hash", "model": "", "status": "ok", "notes": sha[:12]}
+        )
 
     ingested = now_iso()
     # Compute source_id here so the try block below has it.
@@ -195,6 +210,15 @@ async def ingest_file(
             source_id=source_id, sha=sha, stage="NORMALIZED",
             latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
         )
+        if progress is not None:
+            progress.append(
+                {
+                    "stage": "normalize",
+                    "model": "",
+                    "status": "ok",
+                    "notes": f"{estimate_tokens(body)} tokens",
+                }
+            )
 
         # Check for partial transcription sentinel.
         partial_sentinel = "<!-- sb:partial"
@@ -225,9 +249,46 @@ async def ingest_file(
             out = await extract(
                 client, cfg, body, store.all_topic_titles(),
                 source_type=stage,
+                source_id=source_id,
             )
         except CreditExhaustedError:
             raise
+        except ConfidenceFloorError as e:
+            # Quarantine: LLM output was valid but no topic cleared the floor;
+            # preserve the raw file for later review rather than deadlettering.
+            log.warning(
+                "pipeline.file.quarantined",
+                source_id=source_id,
+                path=str(path),
+                quarantine_dir=cfg.extraction.quarantine_dir,
+                reason="all_topics_below_confidence_floor",
+                confidence_floor=cfg.extraction.confidence_floor,
+                max_topic_confidence=e.max_confidence,
+            )
+            qdir = Path(cfg.extraction.quarantine_dir)
+            if not qdir.is_absolute():
+                qdir = cfg.brain_root / qdir
+            qdir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(Exception):
+                shutil.copy2(path, qdir / f"{source_id}{path.suffix}")
+            with contextlib.suppress(Exception):
+                store.transition(
+                    source_id, IngestStage.FAILED, error=str(e),
+                )
+                store.save()
+            if progress is not None:
+                progress.append(
+                    {
+                        "stage": "extract",
+                        "model": cfg.models.text,
+                        "status": "warn",
+                        "notes": (
+                            f"0 topics above confidence_floor="
+                            f"{cfg.extraction.confidence_floor}"
+                        ),
+                    }
+                )
+            return IngestStage.FAILED
         except (ExtractionError, Exception) as e:
             _fail_file_safe(
                 path, cfg, msg=str(e), store=store,
@@ -239,6 +300,23 @@ async def ingest_file(
             source_id=source_id, sha=sha, stage="EXTRACTED",
             latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
         )
+        if progress is not None:
+            extract_confs = [t.confidence for t in out.topics]
+            if extract_confs:
+                extract_notes = (
+                    f"{len(out.topics)} topics, conf "
+                    f"{min(extract_confs):.2f}-{max(extract_confs):.2f}"
+                )
+            else:
+                extract_notes = f"{len(out.topics)} topics"
+            progress.append(
+                {
+                    "stage": "extract",
+                    "model": cfg.models.text,
+                    "status": "ok",
+                    "notes": extract_notes,
+                }
+            )
 
         # -- Phase 2 embedding step (before linking) ------------------
         source_chunks: list[tuple[str, list[float]]] = []
@@ -253,12 +331,26 @@ async def ingest_file(
             ctexts = chunk_text(body)
             cvecs = await embedder.embed_texts(ctexts)
             source_chunks = list(zip(ctexts, cvecs, strict=False))
+            embed_latency_ms = round(
+                (time.perf_counter() - t_stage) * 1000, 1
+            )
             log.info(
                 "pipeline.stage.end",
                 source_id=source_id, sha=sha, stage="EMBEDDING",
                 n_chunks=len(source_chunks),
-                latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+                model=cfg.models.embedding,
+                dim=embedder.dim,
+                latency_ms=embed_latency_ms,
             )
+            if progress is not None:
+                progress.append(
+                    {
+                        "stage": "embed",
+                        "model": cfg.models.embedding,
+                        "status": "ok",
+                        "notes": f"{len(source_chunks)} chunks",
+                    }
+                )
 
         # -- Stage 4: Link --------------------------------------------
         t_stage = time.perf_counter()
@@ -271,11 +363,32 @@ async def ingest_file(
         )
         decisions = await linker.link(out.topics, ctx)
         store.transition(source_id, IngestStage.LINKED)
+        link_latency_ms = round((time.perf_counter() - t_stage) * 1000, 1)
         log.info(
             "pipeline.stage.end",
             source_id=source_id, sha=sha, stage="LINKED",
-            latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+            latency_ms=link_latency_ms,
         )
+        n_new = sum(1 for d in decisions if d.action == TopicAction.NEW)
+        n_match = sum(1 for d in decisions if d.action == TopicAction.MATCH)
+        log.info(
+            "link.decisions",
+            source_id=source_id,
+            n_decisions=len(decisions),
+            n_new=n_new,
+            n_match=n_match,
+            model=cfg.models.embedding,
+            latency_ms=link_latency_ms,
+        )
+        if progress is not None:
+            progress.append(
+                {
+                    "stage": "link",
+                    "model": cfg.models.embedding,
+                    "status": "ok",
+                    "notes": f"{n_new} new, {n_match} match",
+                }
+            )
 
         # Upsert the source's chunks before the per-decision loop
         if vec_store is not None and source_chunks and decisions:
@@ -298,6 +411,11 @@ async def ingest_file(
                 decision.confidence,
             )
             store.add_source_to_topic(decision.target_slug, source_id)
+            # Backlink: record which topics this source contributed to (fixes
+            # empty_extractions + orphan_sources in the health check).
+            src_state = store.state.sources[source_id]
+            if decision.target_slug not in src_state.topics:
+                src_state.topics.append(decision.target_slug)
             if vec_store is not None:
                 vec_store.add_topic_member(decision.target_slug, source_id)
 
@@ -333,17 +451,43 @@ async def ingest_file(
             for d in decisions:
                 vec_store.recompute_centroid(d.target_slug)
 
+        wiki_latency_ms = round((time.perf_counter() - t_stage) * 1000, 1)
         log.info(
             "pipeline.stage.end",
             source_id=source_id, sha=sha, stage="WIKI_MERGED",
-            latency_ms=round((time.perf_counter() - t_stage) * 1000, 1),
+            latency_ms=wiki_latency_ms,
         )
+        log.info(
+            "wiki.topics",
+            source_id=source_id,
+            n_new=n_new,
+            n_merged=n_match,
+            latency_ms=wiki_latency_ms,
+        )
+        if progress is not None:
+            progress.append(
+                {
+                    "stage": "wiki",
+                    "model": "",
+                    "status": "ok",
+                    "notes": f"{len(decisions)} pages",
+                }
+            )
 
         # -- Stage 6: Index -------------------------------------------
         index.mark_dirty()
         store.transition(source_id, IngestStage.INDEXED)
         store.transition(source_id, IngestStage.DONE)
         store.save()
+        if progress is not None:
+            progress.append(
+                {
+                    "stage": "index",
+                    "model": "",
+                    "status": "ok",
+                    "notes": "dirty -> queued",
+                }
+            )
         store.append_changelog(
             {
                 "kind": "ingest",
