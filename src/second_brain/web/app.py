@@ -176,21 +176,35 @@ def create_app(cfg=None) -> FastAPI:
         if q.strip():
             # Semantic search via the daemon loopback HTTP API (§12.1).
             # The web UI MUST NOT open a writeable VectorStore.
-            try:
-                import httpx
+            import httpx
 
-                daemon_url = (
-                    f"http://{cfg.daemon.http_host}:"
-                    f"{cfg.daemon.http_port}/search_brain"
+            def _title_fallback(note: str) -> None:
+                """Populate hits with title-substring matches + a note."""
+                nonlocal fallback_note
+                fallback_note = note
+                q_lower = q.lower()
+                for slug, t in store.state.topics.items():
+                    if q_lower in t.title.lower():
+                        hits.append(
+                            {
+                                "source_id": "",
+                                "topic_slug": slug,
+                                "text": t.title,
+                                "score": 0.0,
+                            }
+                        )
+                hits.sort(key=lambda x: x["topic_slug"] or "")
+
+            http = getattr(request.app.state, "daemon_client", None)
+            try:
+                if http is None:
+                    raise httpx.ConnectError("daemon client not initialized")
+                resp = await http.post(
+                    "/search_brain",
+                    json={"query": q, "k": 10},
                 )
-                async with httpx.AsyncClient() as http:
-                    resp = await http.post(
-                        daemon_url,
-                        json={"query": q, "k": 10},
-                        timeout=10.0,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+                resp.raise_for_status()
+                data = resp.json()
                 for hit in data.get("hits", []):
                     snippet = textwrap.shorten(
                         (hit.get("text") or "").replace("\n", " "),
@@ -205,25 +219,25 @@ def create_app(cfg=None) -> FastAPI:
                             "score": hit.get("score", 0.0),
                         }
                     )
-            except Exception:
-                # Fallback: title-substring search (e.g. daemon not running).
-                fallback_note = (
+            except (httpx.ConnectError, httpx.TimeoutException):
+                # Daemon not running.
+                _title_fallback(
                     "Semantic search unavailable (daemon not running on "
                     f"{cfg.daemon.http_host}:{cfg.daemon.http_port}). "
                     "Showing title matches instead."
                 )
-                q_lower = q.lower()
-                for slug, t in store.state.topics.items():
-                    if q_lower in t.title.lower():
-                        hits.append(
-                            {
-                                "source_id": "",
-                                "topic_slug": slug,
-                                "text": t.title,
-                                "score": 0.0,
-                            }
-                        )
-                hits.sort(key=lambda x: x["topic_slug"] or "")
+            except httpx.HTTPStatusError:
+                # Daemon reachable but returned an error (e.g. 503).
+                _title_fallback(
+                    "Semantic search unavailable (daemon error on "
+                    f"{cfg.daemon.http_host}:{cfg.daemon.http_port}). "
+                    "Showing title matches instead."
+                )
+            except Exception:
+                # Any other failure.
+                _title_fallback(
+                    "Search unavailable. Showing title matches instead."
+                )
 
         return templates.TemplateResponse(
             request,
@@ -260,7 +274,10 @@ def create_app(cfg=None) -> FastAPI:
         return templates.TemplateResponse(request, "chat.html", {})
 
     @app.get("/api/chat")
-    async def chat_api(q: str = Query("", min_length=0)) -> StreamingResponse:
+    async def chat_api(
+        request: Request,
+        q: str = Query("", min_length=0),
+    ) -> StreamingResponse:
         """SSE endpoint for the chat agent.
 
         Returns a ``text/event-stream`` with typed events matching §12.4.
@@ -276,25 +293,19 @@ def create_app(cfg=None) -> FastAPI:
                 media_type="text/event-stream",
             )
 
-        import httpx
-
         from second_brain.chat import chat_stream
         from second_brain.openrouter_client import OpenRouterClient
 
-        daemon_url = (
-            f"http://{cfg.daemon.http_host}:"
-            f"{cfg.daemon.http_port}/search_brain"
-        )
-
         async def _remote_search(query: str, k: int) -> list[dict]:
-            async with httpx.AsyncClient() as http:
-                resp = await http.post(
-                    daemon_url,
-                    json={"query": query, "k": k},
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-                return resp.json().get("hits", [])
+            http = getattr(request.app.state, "daemon_client", None)
+            if http is None:
+                return []
+            resp = await http.post(
+                "/search_brain",
+                json={"query": query, "k": k},
+            )
+            resp.raise_for_status()
+            return resp.json().get("hits", [])
 
         async def event_gen() -> AsyncGenerator[str, None]:
             client: OpenRouterClient | None = None
@@ -327,6 +338,26 @@ def create_app(cfg=None) -> FastAPI:
             event_gen(),
             media_type="text/event-stream",
         )
+
+    # -- lifecycle: shared httpx client for daemon calls (§12.1) ---------
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        import httpx
+
+        app.state.daemon_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=1.0),
+            base_url=(
+                f"http://{cfg.daemon.http_host}:"
+                f"{cfg.daemon.http_port}"
+            ),
+        )
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        client = getattr(app.state, "daemon_client", None)
+        if client is not None:
+            await client.aclose()
 
     return app
 

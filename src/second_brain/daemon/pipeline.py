@@ -676,10 +676,19 @@ async def run_daemon(cfg: Config) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("daemon.shutdown")
     finally:
-        if daemon_task is not None:
+        if daemon_task is not None and not daemon_task.done():
             daemon_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await daemon_task
+        # Surface any startup exception (port conflict, etc.) without
+        # blocking cleanup. If serve() raised immediately the task is
+        # already done with a non-CancelledError exception — suppress it
+        # here so vec_store.close() / client.close() still run.
+        if daemon_task is not None and not daemon_task.cancelled():
+            with contextlib.suppress(Exception):
+                exc = daemon_task.exception()
+                if exc is not None:
+                    log.error("daemon.http_failed", error=str(exc))
         watcher.stop(observer)
         await index.flush_now()
         if vec_store is not None:

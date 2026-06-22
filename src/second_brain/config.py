@@ -10,7 +10,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # -- section models ----------------------------------------------------------
 
@@ -60,6 +60,18 @@ class DaemonCfg(BaseModel):
 
     http_host: str = "127.0.0.1"
     http_port: int = 8001
+
+    @field_validator("http_host")
+    @classmethod
+    def _loopback_only(cls, v: str) -> str:
+        """The daemon has no auth and must never bind externally (§12.7)."""
+        allowed = {"127.0.0.1", "localhost", "::1"}
+        if v not in allowed:
+            raise ValueError(
+                f"daemon.http_host must be loopback ({allowed}); got {v!r}. "
+                "The daemon has no auth and must never bind externally (§12.7)."
+            )
+        return v
 
 
 class TypesCfg(BaseModel):

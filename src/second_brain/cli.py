@@ -153,27 +153,37 @@ def ingest(
         _render_stage_table(progress)
 
 
+async def _daemon_search(
+    cfg, query: str, *, k: int = 10, timeout: float = 5.0,
+) -> list[dict] | None:
+    """Try the daemon HTTP search endpoint.
+
+    Returns the hits list on success, or ``None`` if the daemon is not
+    reachable (ConnectError / TimeoutException). Single-writer invariant
+    (§12.1): the daemon owns the writeable VectorStore.
+    """
+    import httpx
+
+    try:
+        url = (
+            f"http://{cfg.daemon.http_host}:"
+            f"{cfg.daemon.http_port}/search_brain"
+        )
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=0.5)
+        ) as http:
+            resp = await http.post(url, json={"query": query, "k": k})
+            resp.raise_for_status()
+            return resp.json().get("hits", [])
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return None
+
+
 @app.command()
 def search(
     query: Annotated[str, typer.Argument(help="Search query.")],
 ) -> None:
     """Search the brain using hybrid retrieval (Phase 2)."""
-
-    async def _remote_search_brain(cfg, query: str, k: int = 5) -> list[dict] | None:
-        """Try the daemon HTTP endpoint. Return None if daemon is not reachable."""
-        import httpx
-
-        try:
-            url = (
-                f"http://{cfg.daemon.http_host}:"
-                f"{cfg.daemon.http_port}/search_brain"
-            )
-            async with httpx.AsyncClient() as http:
-                resp = await http.post(url, json={"query": query, "k": k}, timeout=3.0)
-                resp.raise_for_status()
-                return resp.json().get("hits", [])
-        except (httpx.ConnectError, httpx.TimeoutException):
-            return None
 
     async def _search() -> None:
         from second_brain.openrouter_client import OpenRouterClient
@@ -184,7 +194,7 @@ def search(
         cfg = load_config()
 
         # Try the daemon first (single-writer invariant, §12.1).
-        remote_hits = await _remote_search_brain(cfg, query, k=5)
+        remote_hits = await _daemon_search(cfg, query, k=5)
         if remote_hits is not None:
             if not remote_hits:
                 typer.echo("No results.")
@@ -238,48 +248,65 @@ def compact() -> None:
     """Run one compaction pass (Phase 4 — merge similar topics)."""
 
     async def _compact() -> None:
-        from second_brain.compact.compaction import run_compaction
+        import httpx
+
         from second_brain.compact.eval import run_health_check
-        from second_brain.openrouter_client import OpenRouterClient
         from second_brain.state import BrainStateStore
-        from second_brain.vectors.embed import Embedder
-        from second_brain.vectors.store import VectorStore
 
         cfg = load_config()
         configure_logging(cfg.brain_root)
-        client = OpenRouterClient(cfg)
-        embedder = Embedder(client, cfg)
-        dim = await embedder.ensure_dim()
-        vec_store = VectorStore(
-            cfg.brain_root / ".brain/embeddings.db",
-            cfg.models.embedding,
-            dim=dim,
-        )
-        store = BrainStateStore.load(cfg)
 
+        # Try the daemon first (single-writer invariant, §12.1). Compaction
+        # is slow (LLM synthesis rewrites), so allow a long timeout.
         try:
-            summary = await run_compaction(
-                cfg, store, vec_store, client,
-                merge_threshold=cfg.compaction.merge_threshold,
+            url = (
+                f"http://{cfg.daemon.http_host}:"
+                f"{cfg.daemon.http_port}/compact"
             )
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=2.0)
+            ) as http:
+                resp = await http.post(url)
+                resp.raise_for_status()
+            summary = resp.json().get("summary", {})
+        except (httpx.ConnectError, httpx.TimeoutException):
+            # Daemon not running — fall back to a local writeable store.
+            from second_brain.compact.compaction import run_compaction
+            from second_brain.openrouter_client import OpenRouterClient
+            from second_brain.vectors.embed import Embedder
+            from second_brain.vectors.store import VectorStore
 
-            # NOTE: the INDEX.md "## Brain Health" section is now rendered by
-            # ``DebouncedIndex._flush()`` on every flush (P2.3), so we no
-            # longer append it here — the debounced flush (or the next
-            # ingest's flush) regenerates INDEX.md from scratch and would
-            # erase anything we appended anyway.
-            report = run_health_check(cfg, store)
-
-            typer.echo(f"Compaction complete: {summary['merges']} merges.")
-            for a, b, sim in summary["pairs"]:
-                typer.echo(f"  {b} -> {a} (sim={sim:.4f})")
-            typer.echo(
-                f"Health: {report['source_count']} sources, "
-                f"{report['topic_count']} topics."
+            client = OpenRouterClient(cfg)
+            embedder = Embedder(client, cfg)
+            dim = await embedder.ensure_dim()
+            vec_store = VectorStore(
+                cfg.brain_root / ".brain/embeddings.db",
+                cfg.models.embedding,
+                dim=dim,
             )
-        finally:
-            vec_store.close()
-            await client.close()
+            store = BrainStateStore.load(cfg)
+            try:
+                summary = await run_compaction(
+                    cfg, store, vec_store, client,
+                    merge_threshold=cfg.compaction.merge_threshold,
+                )
+            finally:
+                vec_store.close()
+                await client.close()
+
+        # After compaction (either path): reload state and run the health
+        # check. The daemon path saved state server-side, so a fresh load
+        # sees the post-compaction topics.
+        store = BrainStateStore.load(cfg)
+        report = run_health_check(cfg, store)
+
+        typer.echo(f"Compaction complete: {summary['merges']} merges.")
+        for a, b, sim in summary["pairs"]:
+            typer.echo(f"  {b} -> {a} (sim={sim:.4f})")
+        typer.echo(
+            f"Health: {report['source_count']} sources, "
+            f"{report['topic_count']} topics."
+        )
 
     asyncio.run(_compact())
 
@@ -335,22 +362,6 @@ def ask(
 ) -> None:
     """Ask a question via the chat agent (Phase 6)."""
 
-    async def _remote_search_brain(cfg, query: str, k: int = 8) -> list[dict] | None:
-        """Try the daemon HTTP endpoint. Return None if daemon is not reachable."""
-        import httpx
-
-        try:
-            url = (
-                f"http://{cfg.daemon.http_host}:"
-                f"{cfg.daemon.http_port}/search_brain"
-            )
-            async with httpx.AsyncClient() as http:
-                resp = await http.post(url, json={"query": query, "k": k}, timeout=3.0)
-                resp.raise_for_status()
-                return resp.json().get("hits", [])
-        except (httpx.ConnectError, httpx.TimeoutException):
-            return None
-
     async def _ask() -> None:
         from second_brain.chat import chat_stream
         from second_brain.openrouter_client import OpenRouterClient
@@ -397,11 +408,11 @@ def ask(
             store = BrainStateStore.load(cfg)
 
             # Try the daemon first (single-writer invariant, §12.1).
-            remote_hits = await _remote_search_brain(cfg, query, k=8)
+            remote_hits = await _daemon_search(cfg, query, k=8)
 
             if remote_hits is not None:
                 async def _search_fn(q: str, k: int) -> list[dict]:
-                    return await _remote_search_brain(cfg, q, k=k) or []
+                    return await _daemon_search(cfg, q, k=k) or []
 
                 async for event in chat_stream(
                     query,

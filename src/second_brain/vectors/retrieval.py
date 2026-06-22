@@ -78,6 +78,9 @@ async def search_brain(
         A list of :class:`SearchHit` objects, highest score first.
     """
     qvec = await embedder.embed_query(query)
+    # MUST NOT await while iterating — sqlite3 cursor is not thread/await-safe.
+    # The store methods below fully materialize rows (fetchall/fetchone)
+    # before returning, so the subsequent ``for`` loop is safe to await in.
     vhits = store.vector_search_chunks(qvec, k=merge_k)
     try:
         fhits = store.fts_search(query, k=merge_k)

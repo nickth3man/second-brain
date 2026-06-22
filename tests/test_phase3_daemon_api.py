@@ -131,6 +131,28 @@ class TestDaemonApi:
         assert hit["topic_slug"] == ""
         assert hit["source_id"] == "orphan-src"
 
+    def test_search_brain_returns_503_on_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When search_brain raises, the endpoint returns 503 (not 500).
+
+        The response body must NOT leak a traceback (§12.7 hardening).
+        """
+        async def _boom(query, store, embedder, *, k=10, merge_k=20):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "second_brain.vectors.retrieval.search_brain", _boom
+        )
+        app = create_daemon_app(_FakeVecStore(), _FakeEmbedder(), SimpleNamespace())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/search_brain", json={"query": "x"})
+        assert resp.status_code == 503
+        body = resp.text
+        assert "Traceback" not in body
+        assert "search failed" in body
+
 
 class TestChatAgentSearchFn:
     """The chat agent's search_fn parameter (the remote-search path)."""

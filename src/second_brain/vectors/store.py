@@ -343,6 +343,7 @@ class VectorStore:
         ).fetchall()
 
         vectors: list[np.ndarray] = []
+        # MUST NOT await while iterating — sqlite3 cursor is not thread/await-safe.
         for mr in meta_rows:
             blob_row = self.db.execute(
                 "SELECT embedding FROM source_chunks_vec WHERE rowid = ?",
@@ -498,6 +499,7 @@ class VectorStore:
             (highest similarity first).
         """
         packed = _pack(query_vec, self.dim)
+        # MUST NOT await while iterating — sqlite3 cursor is not thread/await-safe.
         rows = self.db.execute(
             "SELECT rowid, distance FROM source_chunks_vec "
             "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
@@ -548,6 +550,7 @@ class VectorStore:
         Returns:
             ``[(rowid, bm25_score), ...]`` sorted by BM25 (lower is better).
         """
+        # MUST NOT await while iterating — sqlite3 cursor is not thread/await-safe.
         rows = self.db.execute(
             "SELECT rowid, bm25(source_chunks_fts) AS score "
             "FROM source_chunks_fts "
@@ -561,6 +564,7 @@ class VectorStore:
 
     def get_chunk(self, rowid: int) -> dict[str, Any] | None:
         """Return the metadata row for a chunk, or ``None``."""
+        # MUST NOT await while iterating — sqlite3 cursor is not thread/await-safe.
         row = self.db.execute(
             "SELECT * FROM source_chunks_meta WHERE rowid = ?",
             (rowid,),

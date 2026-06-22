@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
@@ -29,16 +29,18 @@ class SearchResponse(BaseModel):
 
 
 def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
-    """Build the daemon's FastAPI sub-app with /search_brain and /health.
+    """Build the daemon's FastAPI sub-app with /search_brain, /compact, /health.
 
     Args:
         vec_store: The daemon-owned writeable VectorStore (used for reads
             here — writes happen only via the pipeline).
-        embedder: The daemon's Embedder instance.
-        cfg: Application Config (kept for future endpoints; unused today).
+        embedder: The daemon's Embedder instance. Its ``.client`` attribute
+            is the OpenRouterClient the daemon created; compaction reuses it.
+        cfg: Application Config (used by the ``/compact`` endpoint).
 
     Returns:
-        A FastAPI sub-app exposing ``POST /search_brain`` and ``GET /health``.
+        A FastAPI sub-app exposing ``POST /search_brain``, ``POST /compact``
+        and ``GET /health``.
     """
     app = FastAPI(title="Second Brain Daemon API", version="0.1.0")
 
@@ -46,7 +48,22 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
     async def search_brain_endpoint(req: SearchRequest) -> SearchResponse:
         from second_brain.vectors.retrieval import search_brain
 
-        results = await search_brain(req.query, vec_store, embedder, k=req.k)
+        try:
+            results = await search_brain(
+                req.query, vec_store, embedder, k=req.k
+            )
+        except Exception as exc:
+            # Never leak a 500 / traceback to the web UI. Return 503 so the
+            # caller can fall back to a degraded path (e.g. title search).
+            kind = (
+                "embedder"
+                if "embed" in type(exc).__name__.lower()
+                else "unknown"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"search failed: {kind}",
+            ) from exc
         return SearchResponse(
             hits=[
                 SearchHitResponse(
@@ -58,6 +75,35 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
                 for h in results
             ]
         )
+
+    @app.post("/compact")
+    async def compact_endpoint() -> dict[str, Any]:
+        """Run one compaction pass using the daemon's writeable store.
+
+        Routes ``brain compact`` through the single writer (§12.1) so the
+        CLI never opens its own writeable VectorStore while the daemon is
+        running.
+        """
+        from second_brain.compact.compaction import run_compaction
+        from second_brain.state import BrainStateStore
+
+        try:
+            store = BrainStateStore.load(cfg)
+            summary = await run_compaction(
+                cfg,
+                store,
+                vec_store,
+                # The daemon's embedder wraps the OpenRouterClient; reuse it
+                # for synthesis rewrites instead of building a new one.
+                embedder.client,
+                merge_threshold=cfg.compaction.merge_threshold,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"compaction failed: {type(exc).__name__}",
+            ) from exc
+        return {"summary": summary}
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -76,6 +122,14 @@ async def start_daemon_server(
     """
     import uvicorn
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
+        # The daemon owns signal handling; uvicorn must not install its own
+        # handlers (they'd hijack Ctrl-C / SIGTERM from the watcher loop).
+        install_signal_handlers=False,
+    )
     server = uvicorn.Server(config)
     await server.serve()

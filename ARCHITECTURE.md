@@ -572,7 +572,7 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 - **sqlite-vec** — embedded, Windows-native wheels, single `.brain/embeddings.db`, MIT. Beats Chroma (CVE-2026-45829, CVSS 10, unpatched + messy migrations), Milvus Lite (immature single-process lock), FAISS (Windows pip pain), Qdrant (needs a server).
 - Schema: `model_registry` (active model + dim, append-only) · `source_chunks_vec` (`vec0` float[1536] cosine) · `topic_centroids_vec` · `topic_members` · `source_chunks_fts` (FTS5 BM25 mirror) · `vec_tombstones`.
 - **Hybrid retrieval** for `search_brain`: vector + FTS5 merged via **RRF (k=60)**. Topic-merge stays **vector-only** (semantic; no lexical overlap expected). int8 quantization at 10k+ scale (~35–45 MB).
-- **Concurrency (1a):** the single-process SQLite lock means the **daemon owns ALL writes**; the FastAPI UI opens read-only (`?mode=ro`) and calls the daemon over **loopback HTTP** for `search_brain` / `reindex`. `search_brain` lives in the daemon, not in FastAPI.
+- **Concurrency (1a):** the single-process SQLite lock means the **daemon owns ALL writes**; the FastAPI UI opens **no SQLite connection at all** and calls the daemon over **loopback HTTP** for `search_brain` / `reindex` / `compact`. `search_brain` lives in the daemon, not in FastAPI.
 
 ### 12.2 Structured output & extraction reliability  *(lib-4)*
 - Mechanism: `response_format: json_schema strict` (Pydantic `model_json_schema()`) + OpenRouter **`response-healing`** plugin (free, 80%+ JSON-defect reduction) + `provider.require_parameters: true` + Pydantic **`extra="forbid"`** + `model_validate_json()`.

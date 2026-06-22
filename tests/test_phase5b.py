@@ -172,15 +172,23 @@ class TestSearch:
         assert "No results" in body or "0 result" in body
 
     def test_search_uses_daemon_when_reachable(
-        self, client: TestClient
+        self, app
     ) -> None:
         """When the daemon HTTP endpoint is reachable, /search uses its hits
         and does NOT fall back to title-substring matching.
 
         Verifies the §12.1 single-writer invariant: the web UI goes through
         the daemon loopback API rather than opening a writeable VectorStore.
+
+        The shared httpx client is lifted to ``app.state`` at startup
+        (Item 6b), so we mock the transport at client construction time and
+        drive startup via the TestClient context manager.
         """
         import httpx
+
+        import second_brain.web.app as web_app
+
+        web_app._store = None  # noqa: SLF001 — fresh store load
 
         daemon_payload = {
             "hits": [
@@ -198,9 +206,8 @@ class TestSearch:
             return httpx.Response(200, json=daemon_payload)
 
         transport = httpx.MockTransport(_handler)
-        # Patch httpx.AsyncClient to use the mock transport for the duration
-        # of this request. The route constructs the client with no transport
-        # arg, so we patch the class default.
+        # The shared client is created in the startup event; patch
+        # AsyncClient construction so the startup-built client uses the mock.
         original_init = httpx.AsyncClient.__init__
 
         def _patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -209,7 +216,10 @@ class TestSearch:
 
         httpx.AsyncClient.__init__ = _patched_init  # type: ignore[method-assign]
         try:
-            resp = client.get("/search?q=anything")
+            # Context manager triggers lifespan startup (builds the shared
+            # daemon_client) and shutdown (closes it).
+            with TestClient(app) as client:
+                resp = client.get("/search?q=anything")
         finally:
             httpx.AsyncClient.__init__ = original_init  # type: ignore[method-assign]
 
