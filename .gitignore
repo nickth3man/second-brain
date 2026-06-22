@@ -8,8 +8,9 @@
 # .brain/ snapshots — pre-rebuild backups (§12.6)
 .brain/snapshots/
 
-# .brain/ deadletter — failed extractions
-.brain/deadletter/
+# .brain/ deadletter — failed extractions (keep folder, ignore contents)
+.brain/deadletter/*
+!.brain/deadletter/.gitkeep
 
 # .brain/ quarantine — low-confidence extractions
 .brain/quarantine/
@@ -46,12 +47,24 @@ dist/
 .ruff_cache/
 .pytest_cache/
 
-# Inbox — binary originals bloat git (§12.8)
-00-inbox/
+# 00-inbox/ — user's private raw originals (keep folder, ignore contents, §12.8)
+00-inbox/*
+!00-inbox/.gitkeep
 
-# --- TRACKED EXPLICITLY (do NOT ignore) ---
-# .brain/state.json  — topic graph + source registry
-# .brain/changelog.jsonl  — append-only audit log
+# 50-sources/ — AI-normalized markdown, per-user derived data
+50-sources/*
+!50-sources/.gitkeep
+
+# 90-wiki/ — living topic wiki, per-user derived data
+90-wiki/*
+!90-wiki/.gitkeep
+
+# .brain/ state — per-user topic graph + append-only audit log (regenerated on first run)
+.brain/state.json
+.brain/changelog.jsonl
+
+# INDEX.md — auto-generated brain front door (regenerated on ingest)
+INDEX.md
 
 # Real config — contains the user's API key + model choices (gitignored).
 # Copy config.example.toml -> config.toml and fill in your key.
