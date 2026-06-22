@@ -359,6 +359,38 @@ class VectorStore:
         self.upsert_topic_centroid(topic_slug, mean_vec, len(src_ids))
         return mean_vec
 
+    def source_centroid(self, source_id: str) -> list[float] | None:
+        """Return the mean chunk-embedding vector for *source_id*.
+
+        Queries all chunk rows in ``source_chunks_vec`` joined with
+        ``source_chunks_meta`` whose ``source_id`` matches, and returns
+        their mean vector.  Mirrors :meth:`recompute_centroid` but is
+        filtered by source rather than topic.
+
+        Returns:
+            The mean vector as a ``list[float]``, or ``None`` if the
+            source has no chunks in the store.
+        """
+        meta_rows = self.db.execute(
+            "SELECT rowid FROM source_chunks_meta WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+
+        vectors: list[np.ndarray] = []
+        for mr in meta_rows:
+            blob_row = self.db.execute(
+                "SELECT embedding FROM source_chunks_vec WHERE rowid = ?",
+                (mr["rowid"],),
+            ).fetchone()
+            if blob_row is not None:
+                vec = _unpack(blob_row["embedding"], self.dim)
+                vectors.append(np.array(vec, dtype=np.float32))
+
+        if not vectors:
+            return None
+
+        return np.mean(vectors, axis=0).tolist()
+
     def upsert_topic_centroid(
         self,
         slug: str,

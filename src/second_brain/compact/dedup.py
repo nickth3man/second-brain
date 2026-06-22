@@ -47,6 +47,10 @@ async def find_near_duplicates(
 ) -> list[tuple[str, str, float]]:
     """Find pairs of sources whose embeddings are near-duplicates.
 
+    This function is the O(n²) batch detector used by manual/CLI
+    compaction passes.  For per-file pipeline use, prefer
+    :func:`find_near_duplicates_for_source` (O(n) per ingest).
+
     For each source, embeds a representative text (reads the
     ``50-sources/{source_id}.md`` file body) and compares pairwise.
 
@@ -100,6 +104,7 @@ async def find_near_duplicates_for_source(
     cfg,
     store,
     embedder,
+    vec_store,
     new_source_id: str,
     new_embedding: list[float],
     threshold: float = 0.95,
@@ -107,33 +112,74 @@ async def find_near_duplicates_for_source(
     """Find existing sources that are near-duplicates of *new_source*.
 
     Compares the new source's embedding against every existing source's
-    chunk-mean embedding (read from the vector store or re-embedded from
-    50-sources/). Returns ``[(existing_source_id, cosine_similarity), ...]``
-    for every existing source with similarity >= *threshold*, sorted
-    descending. O(n) per ingest — suitable for the per-file pipeline.
+    representative embedding.  O(n) per ingest — suitable for the
+    per-file pipeline.
+
+    Two-tier source-embedding strategy:
+
+    1. **Prefer** ``vec_store.source_centroid(sid)`` when it returns a
+       non-None vector (sources whose chunks are already in the store).
+       This avoids a re-embedding round trip.
+    2. **Fall back** to re-embedding the source file body via
+       ``embedder.embed_one(text)`` only for legacy sources whose chunks
+       are not in the vector store yet.  The fallback path is cached in
+       ``_SOURCE_EMBEDDING_CACHE`` keyed on ``(source_id, sha256)`` so
+       rewrites invalidate the cache automatically.
+
+    Args:
+        cfg: Brain config (used to resolve ``50-sources/<id>.md`` for
+            the fallback path).
+        store: Brain state store — iterated over ``state.sources``.
+        embedder: Embedding client used only for the fallback path.
+        vec_store: Vector store consulted first via
+            :meth:`VectorStore.source_centroid`.
+        new_source_id: The source id of the newly ingested file (skipped
+            in the comparison loop).
+        new_embedding: Representative embedding of the new source (mean
+            of its chunk embeddings).
+        threshold: Minimum cosine similarity to flag as a near-dup.
+
+    Returns:
+        ``[(existing_source_id, cosine_similarity), ...]`` for every
+        existing source with similarity >= *threshold*, sorted
+        descending by similarity.
     """
     hits: list[tuple[str, float]] = []
     for sid in store.state.sources:
         if sid == new_source_id:
             continue
-        src_path = cfg.brain_root / "50-sources" / f"{sid}.md"
-        if not src_path.exists():
-            continue
-        try:
-            text = src_path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        cache_key = (sid, digest)
-        existing_vec = _SOURCE_EMBEDDING_CACHE.get(cache_key)
-        if existing_vec is None:
+
+        # Tier 1: prefer the vector-store centroid when available.
+        existing_vec = None
+        if vec_store is not None:
             try:
-                existing_vec = await embedder.embed_one(text)
+                existing_vec = vec_store.source_centroid(sid)
             except Exception:
-                # Skip sources that cannot be embedded rather than failing
-                # the whole ingest — near-dup surfacing is passive (§11).
+                existing_vec = None
+
+        # Tier 2: fall back to text re-embedding for legacy sources
+        # (no chunks in the store yet).
+        if existing_vec is None:
+            src_path = cfg.brain_root / "50-sources" / f"{sid}.md"
+            if not src_path.exists():
                 continue
-            _SOURCE_EMBEDDING_CACHE[cache_key] = existing_vec
+            try:
+                text = src_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            cache_key = (sid, digest)
+            existing_vec = _SOURCE_EMBEDDING_CACHE.get(cache_key)
+            if existing_vec is None:
+                try:
+                    existing_vec = await embedder.embed_one(text)
+                except Exception:
+                    # Skip sources that cannot be embedded rather than
+                    # failing the whole ingest — near-dup surfacing is
+                    # passive (§11).
+                    continue
+                _SOURCE_EMBEDDING_CACHE[cache_key] = existing_vec
+
         sim = cosine(new_embedding, existing_vec)
         if sim >= threshold:
             hits.append((sid, sim))

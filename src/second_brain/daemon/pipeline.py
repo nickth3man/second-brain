@@ -23,6 +23,7 @@ import shutil
 import time
 from pathlib import Path
 
+import numpy as np
 import structlog
 
 from second_brain.atomicio import write_atomic
@@ -423,18 +424,12 @@ async def ingest_file(
         # + cross-link only.
         if embedder is not None and vec_store is not None and source_chunks:
             chunk_vecs = [v for _, v in source_chunks]
-            _n = len(chunk_vecs)
-            _dim = len(chunk_vecs[0]) if _n else 0
-            source_embedding: list[float] = (
-                [sum(v[d] for v in chunk_vecs) / _n for d in range(_dim)]
-                if _n
-                else []
-            )
+            source_embedding = np.mean(chunk_vecs, axis=0).tolist()
             if source_embedding:
                 try:
                     hits = await find_near_duplicates_for_source(
-                        cfg, store, embedder, source_id, source_embedding,
-                        threshold=0.95,
+                        cfg, store, embedder, vec_store, source_id,
+                        source_embedding, threshold=0.95,
                     )
                 except Exception as exc:  # passive: never fail ingest on ndup
                     hits = []
