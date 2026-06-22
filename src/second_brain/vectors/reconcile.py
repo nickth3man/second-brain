@@ -151,3 +151,4 @@ def _repair_tombstones(db, report: VectorReconcileReport) -> None:
     ).fetchall()
     for row in rows:
         report.tombstone_inconsistencies.append(row["source_id"])
+        db.execute("DELETE FROM vec_tombstones WHERE source_id = ?", (row["source_id"],))
