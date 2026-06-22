@@ -174,42 +174,42 @@ def create_app(cfg=None) -> FastAPI:
         fallback_note: str | None = None
 
         if q.strip():
-            # Try semantic search
+            # Semantic search via the daemon loopback HTTP API (§12.1).
+            # The web UI MUST NOT open a writeable VectorStore.
             try:
-                from second_brain.openrouter_client import OpenRouterClient
-                from second_brain.vectors.embed import Embedder
-                from second_brain.vectors.retrieval import search_brain
-                from second_brain.vectors.store import VectorStore
+                import httpx
 
-                client = OpenRouterClient(cfg)
-                embedder = Embedder(client, cfg)
-                dim = await embedder.ensure_dim()
-                vec_store = VectorStore(
-                    cfg.brain_root / ".brain/embeddings.db",
-                    cfg.models.embedding,
-                    dim=dim,
+                daemon_url = (
+                    f"http://{cfg.daemon.http_host}:"
+                    f"{cfg.daemon.http_port}/search_brain"
                 )
-                try:
-                    results = await search_brain(q, vec_store, embedder, k=10)
-                    for hit in results:
-                        snippet = textwrap.shorten(
-                            hit.text.replace("\n", " "), width=160, placeholder="..."
-                        )
-                        hits.append(
-                            {
-                                "source_id": hit.source_id,
-                                "topic_slug": hit.topic_slug,
-                                "text": snippet,
-                                "score": hit.score,
-                            }
-                        )
-                finally:
-                    vec_store.close()
-                    await client.close()
+                async with httpx.AsyncClient() as http:
+                    resp = await http.post(
+                        daemon_url,
+                        json={"query": q, "k": 10},
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                for hit in data.get("hits", []):
+                    snippet = textwrap.shorten(
+                        (hit.get("text") or "").replace("\n", " "),
+                        width=160,
+                        placeholder="...",
+                    )
+                    hits.append(
+                        {
+                            "source_id": hit.get("source_id", ""),
+                            "topic_slug": hit.get("topic_slug", ""),
+                            "text": snippet,
+                            "score": hit.get("score", 0.0),
+                        }
+                    )
             except Exception:
-                # Fallback: title-substring search
+                # Fallback: title-substring search (e.g. daemon not running).
                 fallback_note = (
-                    "Semantic search unavailable (no API key or embedding DB). "
+                    "Semantic search unavailable (daemon not running on "
+                    f"{cfg.daemon.http_host}:{cfg.daemon.http_port}). "
                     "Showing title matches instead."
                 )
                 q_lower = q.lower()
@@ -264,6 +264,8 @@ def create_app(cfg=None) -> FastAPI:
         """SSE endpoint for the chat agent.
 
         Returns a ``text/event-stream`` with typed events matching §12.4.
+        Retrieval goes through the daemon loopback HTTP API (§12.1); the
+        web UI never opens a writeable VectorStore.
         """
         if not q.strip():
             empty = json.dumps(
@@ -274,27 +276,40 @@ def create_app(cfg=None) -> FastAPI:
                 media_type="text/event-stream",
             )
 
+        import httpx
+
         from second_brain.chat import chat_stream
         from second_brain.openrouter_client import OpenRouterClient
-        from second_brain.vectors.embed import Embedder
-        from second_brain.vectors.store import VectorStore
+
+        daemon_url = (
+            f"http://{cfg.daemon.http_host}:"
+            f"{cfg.daemon.http_port}/search_brain"
+        )
+
+        async def _remote_search(query: str, k: int) -> list[dict]:
+            async with httpx.AsyncClient() as http:
+                resp = await http.post(
+                    daemon_url,
+                    json={"query": query, "k": k},
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                return resp.json().get("hits", [])
 
         async def event_gen() -> AsyncGenerator[str, None]:
             client: OpenRouterClient | None = None
-            vec_store: VectorStore | None = None
             try:
                 client = OpenRouterClient(cfg)
-                embedder = Embedder(client, cfg)
-                dim = await embedder.ensure_dim()
-                vec_store = VectorStore(
-                    cfg.brain_root / ".brain/embeddings.db",
-                    cfg.models.embedding,
-                    dim=dim,
-                )
                 store = _store_singleton()
-
                 async for event in chat_stream(
-                    q.strip(), cfg, store, vec_store, embedder, client, k=8
+                    q.strip(),
+                    cfg,
+                    store,
+                    vec_store=None,
+                    embedder=None,
+                    client=client,
+                    k=8,
+                    search_fn=_remote_search,
                 ):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as exc:
@@ -305,8 +320,6 @@ def create_app(cfg=None) -> FastAPI:
                 )
                 yield f"data: {err}\n\n"
             finally:
-                if vec_store is not None:
-                    vec_store.close()
                 if client is not None:
                     await client.close()
 

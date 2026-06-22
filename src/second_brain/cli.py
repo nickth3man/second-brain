@@ -159,13 +159,47 @@ def search(
 ) -> None:
     """Search the brain using hybrid retrieval (Phase 2)."""
 
+    async def _remote_search_brain(cfg, query: str, k: int = 5) -> list[dict] | None:
+        """Try the daemon HTTP endpoint. Return None if daemon is not reachable."""
+        import httpx
+
+        try:
+            url = (
+                f"http://{cfg.daemon.http_host}:"
+                f"{cfg.daemon.http_port}/search_brain"
+            )
+            async with httpx.AsyncClient() as http:
+                resp = await http.post(url, json={"query": query, "k": k}, timeout=3.0)
+                resp.raise_for_status()
+                return resp.json().get("hits", [])
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return None
+
     async def _search() -> None:
         from second_brain.openrouter_client import OpenRouterClient
         from second_brain.vectors.embed import Embedder
-        from second_brain.vectors.retrieval import search_brain
+        from second_brain.vectors.retrieval import SearchHit, search_brain
         from second_brain.vectors.store import VectorStore
 
         cfg = load_config()
+
+        # Try the daemon first (single-writer invariant, §12.1).
+        remote_hits = await _remote_search_brain(cfg, query, k=5)
+        if remote_hits is not None:
+            if not remote_hits:
+                typer.echo("No results.")
+                return
+            for i, hit in enumerate(remote_hits, 1):
+                snippet = (hit.get("text") or "")[:120].replace("\n", " ")
+                typer.echo(
+                    f"{i}. [{hit.get('source_id', '')}] "
+                    f"(topic={hit.get('topic_slug')}, "
+                    f"score={float(hit.get('score', 0.0)):.4f})\n"
+                    f"   {snippet}\n"
+                )
+            return
+
+        # Standalone fallback: open a local writeable VectorStore.
         client = OpenRouterClient(cfg)
         embedder = Embedder(client, cfg)
         dim = await embedder.ensure_dim()
@@ -175,7 +209,7 @@ def search(
             dim=dim,
         )
         try:
-            hits = await search_brain(query, vec_store, embedder, k=5)
+            hits: list[SearchHit] = await search_brain(query, vec_store, embedder, k=5)
             if not hits:
                 typer.echo("No results.")
                 return
@@ -204,8 +238,8 @@ def compact() -> None:
     """Run one compaction pass (Phase 4 — merge similar topics)."""
 
     async def _compact() -> None:
-        from second_brain.compact.eval import run_health_check
         from second_brain.compact.compaction import run_compaction
+        from second_brain.compact.eval import run_health_check
         from second_brain.openrouter_client import OpenRouterClient
         from second_brain.state import BrainStateStore
         from second_brain.vectors.embed import Embedder
@@ -301,6 +335,22 @@ def ask(
 ) -> None:
     """Ask a question via the chat agent (Phase 6)."""
 
+    async def _remote_search_brain(cfg, query: str, k: int = 8) -> list[dict] | None:
+        """Try the daemon HTTP endpoint. Return None if daemon is not reachable."""
+        import httpx
+
+        try:
+            url = (
+                f"http://{cfg.daemon.http_host}:"
+                f"{cfg.daemon.http_port}/search_brain"
+            )
+            async with httpx.AsyncClient() as http:
+                resp = await http.post(url, json={"query": query, "k": k}, timeout=3.0)
+                resp.raise_for_status()
+                return resp.json().get("hits", [])
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return None
+
     async def _ask() -> None:
         from second_brain.chat import chat_stream
         from second_brain.openrouter_client import OpenRouterClient
@@ -308,10 +358,65 @@ def ask(
         from second_brain.vectors.embed import Embedder
         from second_brain.vectors.store import VectorStore
 
+        def _emit(event: dict) -> None:
+            t = event["type"]
+            if t == "thinking":
+                typer.echo("[thinking] " + event["content"])
+            elif t == "reasoning_delta":
+                typer.echo("(think) " + event["content"], nl=False)
+            elif t == "tool_call":
+                typer.echo(
+                    "[tool] " + event["tool"] + " -> args=" + str(event["args"])
+                )
+            elif t == "tool_result":
+                hits = event.get("hits", [])
+                err = event.get("error")
+                if err:
+                    typer.echo("[tool] " + event["tool"] + " -> error=" + err)
+                else:
+                    typer.echo(
+                        "[tool] " + event["tool"]
+                        + " -> " + str(len(hits)) + " hits"
+                    )
+                    for h in hits:
+                        typer.echo(
+                            "  " + h["source_id"]
+                            + " topic=" + str(h["topic_slug"])
+                            + " score=" + str(h["score"])
+                        )
+            elif t == "answer_delta":
+                typer.echo(event["content"], nl=False)
+            elif t == "done":
+                typer.echo("")
+                typer.echo("[done]")
+
         cfg = load_config()
         configure_logging(cfg.brain_root)
         client = OpenRouterClient(cfg)
         try:
+            store = BrainStateStore.load(cfg)
+
+            # Try the daemon first (single-writer invariant, §12.1).
+            remote_hits = await _remote_search_brain(cfg, query, k=8)
+
+            if remote_hits is not None:
+                async def _search_fn(q: str, k: int) -> list[dict]:
+                    return await _remote_search_brain(cfg, q, k=k) or []
+
+                async for event in chat_stream(
+                    query,
+                    cfg,
+                    store,
+                    vec_store=None,
+                    embedder=None,
+                    client=client,
+                    k=8,
+                    search_fn=_search_fn,
+                ):
+                    _emit(event)
+                return
+
+            # Standalone fallback: open a local writeable VectorStore.
             embedder = Embedder(client, cfg)
             dim = await embedder.ensure_dim()
             vec_store = VectorStore(
@@ -319,45 +424,11 @@ def ask(
                 cfg.models.embedding,
                 dim=dim,
             )
-            store = BrainStateStore.load(cfg)
             try:
                 async for event in chat_stream(
                     query, cfg, store, vec_store, embedder, client, k=8
                 ):
-                    t = event["type"]
-                    if t == "thinking":
-                        typer.echo("[thinking] " + event["content"])
-                    elif t == "reasoning_delta":
-                        typer.echo("(think) " + event["content"], nl=False)
-                    elif t == "tool_call":
-                        typer.echo(
-                            "[tool] " + event["tool"]
-                            + " -> args=" + str(event["args"])
-                        )
-                    elif t == "tool_result":
-                        hits = event.get("hits", [])
-                        err = event.get("error")
-                        if err:
-                            typer.echo(
-                                "[tool] " + event["tool"]
-                                + " -> error=" + err
-                            )
-                        else:
-                            typer.echo(
-                                "[tool] " + event["tool"]
-                                + " -> " + str(len(hits)) + " hits"
-                            )
-                            for h in hits:
-                                typer.echo(
-                                    "  " + h["source_id"]
-                                    + " topic=" + str(h["topic_slug"])
-                                    + " score=" + str(h["score"])
-                                )
-                    elif t == "answer_delta":
-                        typer.echo(event["content"], nl=False)
-                    elif t == "done":
-                        typer.echo("")
-                        typer.echo("[done]")
+                    _emit(event)
             finally:
                 vec_store.close()
         finally:

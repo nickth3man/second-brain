@@ -93,6 +93,16 @@ max_audio_minutes = 120
 merge_threshold = 0.85
 
 # ----------------------------------------------------------------------------
+# Daemon loopback HTTP API (§12.1) — single-writer DB invariant.
+# The daemon owns the writeable VectorStore and exposes /search_brain over
+# loopback HTTP so the web UI never needs to open the DB for writes.
+# Bound to 127.0.0.1 ONLY (§12.7) — never 0.0.0.0.
+# ----------------------------------------------------------------------------
+[daemon]
+http_host = "127.0.0.1"
+http_port = 8001
+
+# ----------------------------------------------------------------------------
 # File-type routing (lowercase extensions, no leading dot).
 # Edit only if you add new types. Each maps to a stage in the pipeline.
 # ----------------------------------------------------------------------------

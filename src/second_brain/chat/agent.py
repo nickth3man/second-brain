@@ -7,21 +7,27 @@ matching the SSE schema from §12.4.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from second_brain.vectors.retrieval import search_brain
+
+# Type alias: async fn (query, k) -> list of hit dicts
+# (source_id, topic_slug, text, score). When provided, the chat agent calls
+# this instead of opening a local VectorStore (§12.1 single-writer invariant).
+SearchFn = Callable[[str, int], Awaitable[list[dict[str, Any]]]]
 
 
 async def chat_stream(
     query: str,
     cfg: Any,
     store: Any,
-    vec_store: Any,
-    embedder: Any,
-    client: Any,
+    vec_store: Any | None = None,
+    embedder: Any | None = None,
+    client: Any = None,
     *,
     k: int = 8,
+    search_fn: SearchFn | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Retrieve-then-answer with streaming events.
 
@@ -39,10 +45,13 @@ async def chat_stream(
         query: The user's question.
         cfg: Application config (needs ``cfg.models.chat``).
         store: BrainStateStore (unused in this phase, kept for future tools).
-        vec_store: VectorStore for search.
-        embedder: Embedder with ``embed_query``.
+        vec_store: VectorStore for search. Ignored when ``search_fn`` is set.
+        embedder: Embedder with ``embed_query``. Ignored when ``search_fn`` is set.
         client: OpenRouterClient with ``chat_completion_stream``.
         k: Number of search hits to retrieve.
+        search_fn: Optional async callable ``(query, k) -> list[hit_dict]``
+            used to retrieve hits over the daemon loopback HTTP API. When
+            provided, ``vec_store``/``embedder`` are not used (§12.1).
 
     Yields:
         Event dicts.
@@ -56,16 +65,30 @@ async def chat_stream(
     # 3. tool_result (may fail gracefully)
     hits: list[dict[str, Any]] = []
     try:
-        results = await search_brain(query, vec_store, embedder, k=k)
-        for h in results:
-            hits.append(
-                {
-                    "source_id": h.source_id,
-                    "topic_slug": h.topic_slug,
-                    "score": h.score,
-                    "snippet": h.text[:300],
-                }
-            )
+        if search_fn is not None:
+            # Daemon loopback path — daemon owns the writeable VectorStore.
+            raw_hits = await search_fn(query, k)
+            for h in raw_hits:
+                text = h.get("text", "") or ""
+                hits.append(
+                    {
+                        "source_id": h.get("source_id", ""),
+                        "topic_slug": h.get("topic_slug"),
+                        "score": float(h.get("score", 0.0)),
+                        "snippet": text[:300],
+                    }
+                )
+        else:
+            results = await search_brain(query, vec_store, embedder, k=k)
+            for h in results:
+                hits.append(
+                    {
+                        "source_id": h.source_id,
+                        "topic_slug": h.topic_slug,
+                        "score": h.score,
+                        "snippet": h.text[:300],
+                    }
+                )
         yield {"type": "tool_result", "tool": "search_brain", "hits": hits}
     except Exception as exc:
         yield {
@@ -120,9 +143,11 @@ async def chat_once(
     query: str,
     cfg: Any,
     store: Any,
-    vec_store: Any,
-    embedder: Any,
-    client: Any,
+    vec_store: Any | None = None,
+    embedder: Any | None = None,
+    client: Any = None,
+    *,
+    search_fn: SearchFn | None = None,
 ) -> str:
     """Convenience wrapper that returns the full answer text (for CLI).
 
@@ -130,7 +155,16 @@ async def chat_once(
     content into a single string.
     """
     parts: list[str] = []
-    async for event in chat_stream(query, cfg, store, vec_store, embedder, client):
+    async for event in chat_stream(
+        query,
+        cfg,
+        store,
+        vec_store,
+        embedder,
+        client,
+        k=8,
+        search_fn=search_fn,
+    ):
         if event["type"] == "answer_delta":
             parts.append(event["content"])
     return "".join(parts)

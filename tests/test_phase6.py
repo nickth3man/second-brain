@@ -120,6 +120,8 @@ class _FakeCfg:
 
     def __init__(self, brain_root: Path) -> None:
         self.brain_root = brain_root
+        # Web routes build the daemon loopback URL from these (§12.1).
+        self.daemon = SimpleNamespace(http_host="127.0.0.1", http_port=8001)
 
 
 # ---------------------------------------------------------------------------

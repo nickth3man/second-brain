@@ -50,6 +50,18 @@ class CompactionCfg(BaseModel):
     merge_threshold: float = 0.85
 
 
+class DaemonCfg(BaseModel):
+    """Daemon loopback HTTP API settings (§12.1).
+
+    The daemon owns the writeable VectorStore. The web UI and CLI call this
+    loopback endpoint for ``search_brain``. Always bound to 127.0.0.1 only
+    (never 0.0.0.0 — §12.7).
+    """
+
+    http_host: str = "127.0.0.1"
+    http_port: int = 8001
+
+
 class TypesCfg(BaseModel):
     text: list[str]
     code: list[str]
@@ -112,6 +124,7 @@ class Config(BaseModel):
     git: GitCfg
     brain_root: Path
     compaction: CompactionCfg = Field(default_factory=CompactionCfg)
+    daemon: DaemonCfg = Field(default_factory=DaemonCfg)
 
 
 # -- helpers -----------------------------------------------------------------

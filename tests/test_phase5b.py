@@ -10,6 +10,7 @@ No network, no API key required.  Search falls back to title-substring match.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,10 +25,12 @@ from second_brain.web.app import create_app
 
 
 class _FakeCfg:
-    """Minimal config stub — satisfies BrainStateStore's ``cfg.brain_root``."""
+    """Minimal config stub — satisfies web routes' ``cfg.brain_root`` + ``cfg.daemon``."""
 
     def __init__(self, brain_root: Path) -> None:
         self.brain_root = brain_root
+        # Web routes build the daemon loopback URL from these (§12.1).
+        self.daemon = SimpleNamespace(http_host="127.0.0.1", http_port=8001)
 
 
 def _seed_store(tmp_path: Path) -> BrainStateStore:
@@ -167,6 +170,54 @@ class TestSearch:
         assert resp.status_code == 200
         body = resp.text
         assert "No results" in body or "0 result" in body
+
+    def test_search_uses_daemon_when_reachable(
+        self, client: TestClient
+    ) -> None:
+        """When the daemon HTTP endpoint is reachable, /search uses its hits
+        and does NOT fall back to title-substring matching.
+
+        Verifies the §12.1 single-writer invariant: the web UI goes through
+        the daemon loopback API rather than opening a writeable VectorStore.
+        """
+        import httpx
+
+        daemon_payload = {
+            "hits": [
+                {
+                    "source_id": "src-daemon",
+                    "topic_slug": "test-topic",
+                    "text": "daemon-powered snippet about Test Topic",
+                    "score": 0.42,
+                }
+            ]
+        }
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/search_brain"
+            return httpx.Response(200, json=daemon_payload)
+
+        transport = httpx.MockTransport(_handler)
+        # Patch httpx.AsyncClient to use the mock transport for the duration
+        # of this request. The route constructs the client with no transport
+        # arg, so we patch the class default.
+        original_init = httpx.AsyncClient.__init__
+
+        def _patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            kwargs.setdefault("transport", transport)
+            return original_init(self, *args, **kwargs)
+
+        httpx.AsyncClient.__init__ = _patched_init  # type: ignore[method-assign]
+        try:
+            resp = client.get("/search?q=anything")
+        finally:
+            httpx.AsyncClient.__init__ = original_init  # type: ignore[method-assign]
+
+        assert resp.status_code == 200
+        body = resp.text
+        assert "src-daemon" in body
+        # Should NOT show the fallback note when the daemon answered.
+        assert "daemon not running" not in body
 
 
 class TestHealth:

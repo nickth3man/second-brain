@@ -620,6 +620,7 @@ async def run_daemon(cfg: Config) -> None:
 
     client: OpenRouterClient | None = None
     vec_store: VectorStore | None = None
+    daemon_task: asyncio.Task[None] | None = None
     try:
         client = OpenRouterClient(cfg)
         embedder = Embedder(client, cfg)
@@ -631,6 +632,24 @@ async def run_daemon(cfg: Config) -> None:
         )
         linker: Linker = EmbeddingLinker(
             embedder, vec_store, cfg.ingestion.merge_threshold
+        )
+
+        # Start the daemon loopback HTTP API (§12.1) so the web UI / CLI can
+        # call search_brain without opening a writeable VectorStore.
+        from second_brain.daemon.api import create_daemon_app, start_daemon_server
+
+        daemon_app = create_daemon_app(vec_store, embedder, cfg)
+        daemon_task = asyncio.create_task(
+            start_daemon_server(
+                daemon_app,
+                host=cfg.daemon.http_host,
+                port=cfg.daemon.http_port,
+            )
+        )
+        log.info(
+            "daemon.http_started",
+            host=cfg.daemon.http_host,
+            port=cfg.daemon.http_port,
         )
 
         while True:
@@ -657,6 +676,10 @@ async def run_daemon(cfg: Config) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("daemon.shutdown")
     finally:
+        if daemon_task is not None:
+            daemon_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await daemon_task
         watcher.stop(observer)
         await index.flush_now()
         if vec_store is not None:
