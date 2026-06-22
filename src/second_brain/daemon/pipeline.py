@@ -644,7 +644,7 @@ async def run_daemon(cfg: Config) -> None:
         # call search_brain without opening a writeable VectorStore.
         from second_brain.daemon.api import create_daemon_app, start_daemon_server
 
-        daemon_app = create_daemon_app(vec_store, embedder, cfg)
+        daemon_app = create_daemon_app(vec_store, embedder, cfg, store=store)
         daemon_task = asyncio.create_task(
             start_daemon_server(
                 daemon_app,

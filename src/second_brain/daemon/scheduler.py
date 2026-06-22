@@ -85,6 +85,10 @@ async def maybe_run_compaction(
                 datetime.datetime.now(datetime.UTC) - last
             ).total_seconds()
         except ValueError:
+            log.warning(
+                "compaction.bad_timestamp",
+                ts=store.state.last_compaction_ts,
+            )
             elapsed = 0.0
         if elapsed >= DAILY_INTERVAL_S:
             should_run = True
@@ -119,8 +123,7 @@ async def maybe_run_compaction(
 
     # Post-compaction side-effects — each swallows its own errors so a
     # snapshot or git failure cannot unwind the compaction that already ran.
-    _write_snapshot(cfg, store)
-    _git_commit_on_compaction(cfg, summary)
+    post_compaction(cfg, store, summary)
 
     log.info(
         "compaction.scheduler.done",
@@ -128,6 +131,19 @@ async def maybe_run_compaction(
         reason=reason,
     )
     return True
+
+
+def post_compaction(cfg: Config, store: BrainStateStore, summary: dict) -> None:
+    """Post-compaction side effects: snapshot + git commit (§12.6, §12.8).
+
+    Factored out so both the scheduler (``maybe_run_compaction``) and the
+    daemon's ``POST /compact`` endpoint run identical side-effects after a
+    successful compaction. Each sub-step swallows its own errors so neither
+    a snapshot failure nor a git failure can unwind the compaction that
+    already ran.
+    """
+    _write_snapshot(cfg, store)
+    _git_commit_on_compaction(cfg, summary)
 
 
 def _write_snapshot(cfg: Config, store: BrainStateStore) -> None:  # noqa: ARG001
@@ -142,6 +158,14 @@ def _write_snapshot(cfg: Config, store: BrainStateStore) -> None:  # noqa: ARG00
         snap_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
         dst = snap_dir / f"state-{ts}.json"
+        # Collision guard: if two compactions land in the same second, append
+        # a numeric suffix. The format ``state-{ts}-{i}.json`` still matches
+        # the ``state-*.json`` glob and sorts after the base name.
+        if dst.exists():
+            i = 1
+            while (snap_dir / f"state-{ts}-{i}.json").exists():
+                i += 1
+            dst = snap_dir / f"state-{ts}-{i}.json"
         if src.exists():
             shutil.copy2(src, dst)
 
@@ -210,5 +234,5 @@ def _git_commit_on_compaction(cfg: Config, summary: dict) -> None:
             capture_output=True,
             check=False,
         )
-    except (FileNotFoundError, OSError) as exc:
-        log.warning("compaction.git_commit_failed", error=str(exc))
+    except Exception as exc:
+        log.warning("git.commit_failed", error=str(exc))

@@ -20,6 +20,7 @@ References
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -254,6 +255,97 @@ class TestSchedulerTriggers:
         # Failure surfaces as False, counter is NOT reset, scheduler survives.
         assert ran is False
         assert store.state.sources_since_compaction == DEFAULT_SOURCE_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Periodic-task cancellation tests
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodicTaskCancellation:
+    """The daemon's periodic compaction task must be cleanly cancellable.
+
+    On shutdown, ``run_daemon`` cancels the periodic task and awaits it
+    (§12.3). If the task swallowed ``CancelledError`` or hung, shutdown
+    would block forever. These tests verify the cancellation path works
+    end-to-end with the same loop shape used in ``run_daemon``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_periodic_compaction_task_is_cancellable(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = _make_cfg(tmp_path)
+        _ensure_dirs(cfg)
+        store = BrainStateStore.load(cfg)
+        # Recent ts + zero counter so maybe_run_compaction is a no-op if it
+        # ever runs — what we're testing here is cancellation, not compaction.
+        store.state.last_compaction_ts = _iso(datetime.now(UTC))
+        store.state.sources_since_compaction = 0
+
+        # Mirror the _periodic_compaction_check loop from run_daemon exactly.
+        async def _periodic_compaction_check() -> None:
+            while True:
+                await asyncio.sleep(3600)  # 1 hour
+                try:
+                    await maybe_run_compaction(
+                        cfg, store, _FakeVecStore(), _FakeClient()
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Daemon loop swallows per-iteration errors but NOT
+                    # CancelledError — that must propagate.
+                    _ = exc
+
+        periodic_task = asyncio.create_task(_periodic_compaction_check())
+        # Let the task start and reach the asyncio.sleep(3600) await point.
+        await asyncio.sleep(0)
+
+        periodic_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await periodic_task
+
+        assert periodic_task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_maybe_run_compaction_cancellable_mid_await(
+        self, tmp_path: Path
+    ) -> None:
+        """maybe_run_compaction itself must be cancellable mid-await.
+
+        If run_compaction is in-flight when shutdown fires, the wrapping
+        task's CancelledError must propagate rather than be swallowed by
+        the scheduler's broad except.
+        """
+        cfg = _make_cfg(tmp_path)
+        _ensure_dirs(cfg)
+        store = BrainStateStore.load(cfg)
+        store.state.last_compaction_ts = _iso(datetime.now(UTC))
+        store.state.sources_since_compaction = DEFAULT_SOURCE_THRESHOLD
+
+        started = asyncio.Event()
+
+        async def _slow_compaction(*args, **kwargs):  # noqa: ARG001
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+            return {"merges": 0, "pairs": [], "merged_into": {}}
+
+        with mock.patch(
+            "second_brain.compact.compaction.run_compaction",
+            new=_slow_compaction,
+        ):
+            task = asyncio.create_task(
+                maybe_run_compaction(
+                    cfg, store, _FakeVecStore(), _FakeClient()
+                )
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
 
 
 # ---------------------------------------------------------------------------

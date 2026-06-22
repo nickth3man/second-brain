@@ -28,7 +28,9 @@ class SearchResponse(BaseModel):
     hits: list[SearchHitResponse]
 
 
-def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
+def create_daemon_app(
+    vec_store: Any, embedder: Any, cfg: Any, store: Any = None
+) -> FastAPI:
     """Build the daemon's FastAPI sub-app with /search_brain, /compact, /health.
 
     Args:
@@ -37,6 +39,11 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
         embedder: The daemon's Embedder instance. Its ``.client`` attribute
             is the OpenRouterClient the daemon created; compaction reuses it.
         cfg: Application Config (used by the ``/compact`` endpoint).
+        store: The daemon's in-memory :class:`BrainStateStore` — the single
+            writer (§12.1). When provided (daemon mode), ``POST /compact``
+            uses it directly instead of loading a new one. When ``None``
+            (standalone test mode), the endpoint falls back to
+            ``BrainStateStore.load(cfg)``.
 
     Returns:
         A FastAPI sub-app exposing ``POST /search_brain``, ``POST /compact``
@@ -85,13 +92,20 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
         running.
         """
         from second_brain.compact.compaction import run_compaction
+        from second_brain.daemon.scheduler import post_compaction
         from second_brain.state import BrainStateStore, now_iso
 
         try:
-            store = BrainStateStore.load(cfg)
+            # Daemon mode (store provided): use the daemon's in-memory
+            # store — the single writer. Standalone/test mode: load a
+            # fresh store. Loading a new store in daemon mode would race
+            # with the watcher's writes and double-fire the scheduler.
+            active_store = (
+                store if store is not None else BrainStateStore.load(cfg)
+            )
             summary = await run_compaction(
                 cfg,
-                store,
+                active_store,
                 vec_store,
                 # The daemon's embedder wraps the OpenRouterClient; reuse it
                 # for synthesis rewrites instead of building a new one.
@@ -101,9 +115,13 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
             # Phase 4: a manual compact counts as a compaction run for
             # scheduling purposes — reset the counter + timestamp so the
             # daemon scheduler doesn't immediately fire again (§8).
-            store.state.sources_since_compaction = 0
-            store.state.last_compaction_ts = now_iso()
-            store.save()
+            active_store.state.sources_since_compaction = 0
+            active_store.state.last_compaction_ts = now_iso()
+            active_store.save()
+            # Run the same post-compaction side-effects as the scheduler
+            # (snapshot + git commit) so a manual compact and a scheduled
+            # compact are observationally identical (§12.6, §12.8).
+            post_compaction(cfg, active_store, summary)
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
