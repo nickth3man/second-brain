@@ -708,3 +708,156 @@ def test_pyproject_declares_literal_chat_stack() -> None:
     text = Path("pyproject.toml").read_text(encoding="utf-8")
     assert '"pydantic-ai"' in text
     assert '"fastapi>=0.135"' in text
+
+
+async def test_l3_judge_scores_with_mock_client(tmp_path: Path) -> None:
+    """Happy-path: mock client returns valid JSON; scoring pipeline works end-to-end."""
+    from second_brain.compact.eval import _run_l3_judge
+    from second_brain.frontmatter import dump_frontmatter
+    from second_brain.models import SourceState
+
+    cfg = _cfg(tmp_path)
+    cfg.models = SimpleNamespace(
+        text="anthropic/claude-3.5-sonnet",
+        judge="openai/gpt-4o",
+    )
+
+    # Seed a source with real body content and a matching wiki page.
+    source_dir = tmp_path / "50-sources"
+    wiki_dir = tmp_path / "90-wiki"
+    source_dir.mkdir(parents=True)
+    wiki_dir.mkdir(parents=True)
+
+    (source_dir / "note.md").write_text(
+        dump_frontmatter(
+            {
+                "source": "00-inbox/note.txt",
+                "type": "text",
+                "ingested": "2026-06-22T00:00:00Z",
+                "sha256": "abc",
+                "tokens": 20,
+                "topics": ["topic-a"],
+            },
+            "# Note\nThe Lakers won the 2009 NBA championship.",
+        ),
+        encoding="utf-8",
+    )
+    (wiki_dir / "topic-a.md").write_text(
+        dump_frontmatter(
+            {
+                "title": "Topic A",
+                "type": "concept",
+                "created": "2026-06-22",
+                "updated": "2026-06-22",
+            },
+            "# Topic A\n\n## Synthesis\nThe Los Angeles Lakers won the 2009 title.\n\n## Sources\n",
+        ),
+        encoding="utf-8",
+    )
+
+    store = BrainStateStore.load(cfg)
+    store.state.sources["note"] = SourceState(
+        sha256="abc",
+        raw="00-inbox/note.txt",
+        topics=["topic-a"],
+    )
+    store.ensure_topic("topic-a", "Topic A")
+
+    class MockClient:
+        async def chat_completion_clean(self, model, messages, **kwargs):  # noqa: ANN001, ARG002
+            return (None, '{"score": 0.9, "notes": "well grounded"}')
+
+    result = await _run_l3_judge(cfg, store, MockClient())
+
+    assert result["status"] == "complete"
+    assert result["model"] == "openai/gpt-4o"
+    assert result["score"] == pytest.approx(0.9)
+    assert result["samples"] == 1
+    assert result["raw"][0]["score"] == pytest.approx(0.9)
+
+
+async def test_l3_judge_scores_with_fenced_json_response(tmp_path: Path) -> None:
+    """_parse_judge_score handles JSON wrapped in markdown code fences."""
+    from second_brain.compact.eval import _parse_judge_score
+
+    fenced = '```json\n{"score": 0.75, "notes": "supported"}\n```'
+    assert _parse_judge_score(fenced) == pytest.approx(0.75)
+
+    plain = '{"score": 0.5, "notes": "partial"}'
+    assert _parse_judge_score(plain) == pytest.approx(0.5)
+
+    malformed = "I cannot score this."
+    assert _parse_judge_score(malformed) is None
+
+
+def test_l3_extract_synthesis_stops_at_known_sections(tmp_path: Path) -> None:
+    """_extract_synthesis must treat ## headings inside synthesis as content,
+    only stopping at Sources/Related/etc."""
+    from second_brain.compact.eval import _extract_synthesis
+
+    wiki_body = (
+        "# Topic\n\n"
+        "## Synthesis\n"
+        "## 2009 NBA Season\n"
+        "The Lakers won.\n"
+        "## Key Players\n"
+        "LeBron James led scoring.\n\n"
+        "## Sources\n"
+        "- source entry\n"
+    )
+    synthesis = _extract_synthesis(wiki_body)
+    assert "Lakers won" in synthesis
+    assert "LeBron James" in synthesis
+    assert "Sources" not in synthesis
+    assert "source entry" not in synthesis
+
+
+def test_citation_format_pass_rate_detects_continuation_links(tmp_path: Path) -> None:
+    """Pass rate should be 1.0 when source links are on the '  -> [source](...)' line."""
+    from second_brain.compact.eval import _citation_format_pass_rate
+    from second_brain.frontmatter import dump_frontmatter
+
+    wiki_dir = tmp_path / "90-wiki"
+    wiki_dir.mkdir()
+    (wiki_dir / "topic.md").write_text(
+        dump_frontmatter(
+            {"title": "Topic", "type": "concept", "created": "2026-06-22", "updated": "2026-06-22"},
+            (
+                "# Topic\n\n"
+                "## Synthesis\nSome content.\n\n"
+                "## Sources\n"
+                "- **[2026-06-22]** Topic\n"
+                "  -> [source](../50-sources/2026-06-22-note.md)\n"
+                "  > tldr line\n\n"
+                "## Related\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    rate = _citation_format_pass_rate(tmp_path)
+    assert rate == pytest.approx(1.0)
+
+
+def test_citation_format_pass_rate_misses_missing_link(tmp_path: Path) -> None:
+    """Pass rate should be 0.0 when a source entry has no [source](...) link."""
+    from second_brain.compact.eval import _citation_format_pass_rate
+    from second_brain.frontmatter import dump_frontmatter
+
+    wiki_dir = tmp_path / "90-wiki"
+    wiki_dir.mkdir()
+    (wiki_dir / "topic.md").write_text(
+        dump_frontmatter(
+            {"title": "Topic", "type": "concept", "created": "2026-06-22", "updated": "2026-06-22"},
+            (
+                "# Topic\n\n"
+                "## Sources\n"
+                "- **[2026-06-22]** Topic\n"
+                "  > tldr line (no source link here)\n\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    rate = _citation_format_pass_rate(tmp_path)
+    assert rate == pytest.approx(0.0)

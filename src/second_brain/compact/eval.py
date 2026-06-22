@@ -24,6 +24,13 @@ from second_brain.compact.dedup import cosine
 from second_brain.frontmatter import split_frontmatter
 from second_brain.vectors.store import _unpack
 
+# Section headings that mark the end of the ## Synthesis section.
+# Any other ## heading (e.g. one the LLM generates inside the synthesis body)
+# is treated as synthesis content, not a section boundary.
+_SYNTHESIS_STOP_SECTIONS = frozenset(
+    {"Sources", "Open questions", "Related", "See also", "Trivia", "Changes"}
+)
+
 
 def run_health_check(cfg: object, store: object) -> dict:  # noqa: ARG001
     """Scan ``store.state`` + wiki files and return a health report dict.
@@ -158,13 +165,37 @@ def _citation_format_pass_rate(root: Path) -> float | None:
     passes = 0
     for page in pages:
         text = page.read_text(encoding="utf-8", errors="replace")
-        if "## Sources" not in text:
-            continue
+        in_sources = False
+        entry_open = False
+        entry_has_link = False
         for line in text.splitlines():
-            if line.startswith("- "):
-                checks += 1
-                if re.search(r"\[source\]\(\.\./50-sources/[^)]+\.md\)", line):
-                    passes += 1
+            stripped = line.strip()
+            if stripped == "## Sources":
+                in_sources = True
+                continue
+            if in_sources and stripped.startswith("## "):
+                if entry_open:
+                    checks += 1
+                    if entry_has_link:
+                        passes += 1
+                entry_open = False
+                entry_has_link = False
+                break
+            if not in_sources:
+                continue
+            if stripped.startswith("- **["):
+                if entry_open:
+                    checks += 1
+                    if entry_has_link:
+                        passes += 1
+                entry_open = True
+                entry_has_link = False
+            if re.search(r"\[source\]\(\.\./50-sources/[^)]+\.md\)", line):
+                entry_has_link = True
+        if entry_open:
+            checks += 1
+            if entry_has_link:
+                passes += 1
     return passes / checks if checks else None
 
 
@@ -363,25 +394,32 @@ async def _run_l3_judge(cfg: object, store: object, client: object) -> dict:
         return {"status": "skipped", "reason": "no content to judge"}
 
     scores: list[float] = []
+    raw_scores: list[dict] = []
     for wiki_synthesis, source_excerpt in pairs:
         prompt = (
-            "You are a cross-family quality judge evaluating wiki synthesis "
-            "faithfulness to source material.\n\n"
-            "Score how faithfully the wiki synthesis reflects the source excerpt "
-            "on a 0-1 scale (1.0 = fully supported, 0.0 = unsupported or "
-            "contradicted).\n\n"
-            "Return JSON only: {\"score\": <float>, \"notes\": \"<brief reason>\"}\n\n"
+            "You are a cross-family quality judge evaluating wiki synthesis faithfulness.\n\n"
+            "TASK: Determine whether the factual claims in the wiki synthesis are "
+            "grounded in the source excerpt. A high score means the synthesis makes "
+            "no claims that contradict or go beyond what the source supports. A low "
+            "score means the synthesis contains fabricated, contradicted, or invented "
+            "facts not found in the source.\n\n"
+            "CALIBRATION: Score 1.0 if every claim is directly supported or is a "
+            "reasonable inference. Score 0.5 if some claims are supported and some "
+            "are compressed/generalised but not wrong. Score 0.0 if the synthesis "
+            "contradicts or fabricates facts from the source.\n\n"
+            "Return JSON only — no other text: "
+            "{\"score\": <float 0.0-1.0>, \"notes\": \"<one sentence reason>\"}\n\n"
             f"Wiki synthesis:\n{wiki_synthesis}\n\n"
             f"Source excerpt:\n{source_excerpt}"
         )
-        response = await client.chat_completion(
+        _reasoning, clean_content = await client.chat_completion_clean(
             judge_model,
             [{"role": "user", "content": prompt}],
-            extra_body={"headers": {"X-OpenRouter-Cache": "true"}},
         )
-        parsed = _parse_judge_score(response)
+        parsed = _parse_judge_score(clean_content)
         if parsed is not None:
             scores.append(parsed)
+            raw_scores.append({"score": parsed, "synthesis_chars": len(wiki_synthesis)})
 
     if not scores:
         return {"status": "skipped", "reason": "judge returned no parseable scores"}
@@ -392,6 +430,7 @@ async def _run_l3_judge(cfg: object, store: object, client: object) -> dict:
         "model": judge_model,
         "score": mean_score,
         "samples": len(scores),
+        "raw": raw_scores,
     }
 
 
@@ -442,7 +481,12 @@ def _sample_faithfulness_pairs(cfg: object, store: object) -> list[tuple[str, st
 
 
 def _extract_synthesis(wiki_body: str) -> str:
-    """Return the ``## Synthesis`` section body, or the full wiki body."""
+    """Return the ``## Synthesis`` section body, or the full wiki body.
+
+    Only stops at known terminal section headings (Sources, Related, etc.).
+    Any other ``## ``-level heading the LLM inserts inside the synthesis body
+    is treated as synthesis content, not a section boundary.
+    """
     lines = wiki_body.splitlines()
     synthesis_lines: list[str] = []
     in_synthesis = False
@@ -452,7 +496,9 @@ def _extract_synthesis(wiki_body: str) -> str:
             in_synthesis = True
             continue
         if in_synthesis and stripped.startswith("## "):
-            break
+            section_name = stripped[3:].strip()
+            if section_name in _SYNTHESIS_STOP_SECTIONS:
+                break
         if in_synthesis:
             synthesis_lines.append(line)
     if synthesis_lines:
@@ -460,20 +506,19 @@ def _extract_synthesis(wiki_body: str) -> str:
     return wiki_body.strip()
 
 
-def _parse_judge_score(response: object) -> float | None:
-    """Extract a 0-1 faithfulness score from a judge chat response."""
-    try:
-        if isinstance(response, dict):
-            content = response["choices"][0]["message"]["content"]
-        else:
-            return None
-    except (KeyError, IndexError, TypeError):
-        return None
+def _parse_judge_score(content: str) -> float | None:
+    """Extract a 0-1 faithfulness score from a judge response string.
 
+    Accepts bare JSON or JSON wrapped in markdown code fences.
+    """
     if not isinstance(content, str):
         return None
 
-    match = re.search(r"\{[^{}]*\"score\"[^{}]*\}", content, re.DOTALL)
+    # Strip leading/trailing markdown code fences (```json ... ``` or ``` ... ```)
+    stripped = re.sub(r"^```[a-z]*\n?", "", content.strip(), flags=re.IGNORECASE)
+    stripped = re.sub(r"\n?```$", "", stripped.strip())
+
+    match = re.search(r"\{[^{}]*\"score\"[^{}]*\}", stripped, re.DOTALL)
     if match is None:
         return None
     try:
