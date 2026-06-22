@@ -544,6 +544,11 @@ async def ingest_file(
         # -- Stage 6: Index -------------------------------------------
         index.mark_dirty()
         store.transition(source_id, IngestStage.INDEXED)
+        # Phase 4: bump the scheduler counter (§8 Track 5-2a) just before
+        # the source is marked DONE so a successful ingest is counted once.
+        store.state.sources_since_compaction = (
+            store.state.sources_since_compaction + 1
+        )
         store.transition(source_id, IngestStage.DONE)
         store.save()
         if progress is not None:
@@ -621,6 +626,7 @@ async def run_daemon(cfg: Config) -> None:
     client: OpenRouterClient | None = None
     vec_store: VectorStore | None = None
     daemon_task: asyncio.Task[None] | None = None
+    periodic_task: asyncio.Task[None] | None = None
     try:
         client = OpenRouterClient(cfg)
         embedder = Embedder(client, cfg)
@@ -652,6 +658,24 @@ async def run_daemon(cfg: Config) -> None:
             port=cfg.daemon.http_port,
         )
 
+        # Phase 4: periodic compaction check (§8). Runs every hour as a
+        # fallback for idle brains that don't ingest enough files to trip
+        # the threshold themselves (e.g. >24h with no new sources).
+        from second_brain.daemon.scheduler import maybe_run_compaction
+
+        async def _periodic_compaction_check() -> None:
+            """Check compaction every hour as a fallback for idle brains."""
+            while True:
+                await asyncio.sleep(3600)  # 1 hour
+                try:
+                    await maybe_run_compaction(cfg, store, vec_store, client)
+                except Exception as exc:
+                    log.error(
+                        "daemon.periodic_compaction_failed", error=str(exc)
+                    )
+
+        periodic_task = asyncio.create_task(_periodic_compaction_check())
+
         while True:
             path = await queue.get()
             log.info("daemon.ingest", path=str(path))
@@ -664,6 +688,17 @@ async def run_daemon(cfg: Config) -> None:
                     timeout=PER_FILE_TIMEOUT_S,
                 )
                 log.info("daemon.done", path=str(path), stage=str(stage))
+                # Phase 4: after a successful ingest, check if compaction
+                # should run (§8 Track 5-2a). Runs in the watcher loop
+                # after ingest completes — never blocks the ingest itself.
+                try:
+                    await maybe_run_compaction(
+                        cfg, store, vec_store, client
+                    )
+                except Exception as exc:
+                    log.error(
+                        "daemon.compaction_check_failed", error=str(exc)
+                    )
             except CreditExhaustedError:
                 log.error("daemon.credit_exhausted")
                 raise
@@ -676,6 +711,10 @@ async def run_daemon(cfg: Config) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("daemon.shutdown")
     finally:
+        if periodic_task is not None and not periodic_task.done():
+            periodic_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await periodic_task
         if daemon_task is not None and not daemon_task.done():
             daemon_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

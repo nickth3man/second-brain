@@ -146,3 +146,7 @@ class BrainState(BaseModel):
     topics: dict[str, TopicState] = {}
     sources: dict[str, SourceState] = {}
     updated: str = ""
+    # Phase 4 scheduler fields (§8 Track 5-2a). Defaults keep older
+    # ``state.json`` files loadable (backward compat via ``extra="ignore"``).
+    last_compaction_ts: str = ""        # ISO 8601 of last compaction run
+    sources_since_compaction: int = 0   # counter, reset on compaction

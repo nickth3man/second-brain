@@ -85,7 +85,7 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
         running.
         """
         from second_brain.compact.compaction import run_compaction
-        from second_brain.state import BrainStateStore
+        from second_brain.state import BrainStateStore, now_iso
 
         try:
             store = BrainStateStore.load(cfg)
@@ -98,6 +98,12 @@ def create_daemon_app(vec_store: Any, embedder: Any, cfg: Any) -> FastAPI:
                 embedder.client,
                 merge_threshold=cfg.compaction.merge_threshold,
             )
+            # Phase 4: a manual compact counts as a compaction run for
+            # scheduling purposes — reset the counter + timestamp so the
+            # daemon scheduler doesn't immediately fire again (§8).
+            store.state.sources_since_compaction = 0
+            store.state.last_compaction_ts = now_iso()
+            store.save()
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
