@@ -1,3 +1,6 @@
+# Orchestrator workspace (session state, not project code)
+.slim/deepwork/
+
 # .brain/ embeddings database — sqlite-vec binary blob, regenerable
 .brain/embeddings.db
 .brain/embeddings.db-*

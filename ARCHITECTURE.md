@@ -620,10 +620,13 @@ ends the same way... graveyard in a few weeks."* Layered on two existing defense
 - **Licensing:** stay **PyMuPDF** (AGPL) for personal/open-source; PDF render wrapped behind a `pdf.render()` interface so the AGPL→pypdfium2(Apache) swap is mechanical if ever **conveyed** (binary/installer/multi-tenant SaaS = the real trigger).
 - **Hardening:** FastAPI bound to **127.0.0.1 only**; sqlite-vec chosen over ChromaDB (CVE-2026-45829).
 
-### 12.8 Versioning — git  *(decision 6a)*
-- Single repo at `second-brain/` root, `main` branch only, commit on the compaction pass.
-- **Version:** `50-sources/`, `90-wiki/`, `INDEX.md`, `config.toml`, `ARCHITECTURE.md`, `.brain/state.json`, `.brain/changelog.jsonl`. Markdown diffs → auditable wiki evolution + instant rollback (`git checkout <commit> -- 90-wiki/`).
-- **Ignore:** `.brain/embeddings.db` (+ `-journal`/`-wal`/`-shm`), `.brain/cache/`, `.brain/snapshots/`, `.brain/deadletter/`, `.brain/quarantine/`, `.env`, `*.local.toml`, OS/editor cruft.
+### 12.8 Versioning — git  *(decision 6a, amended for privacy policy)*
+- Single repo at `second-brain/` root, `main` branch only.
+- **Versioned (project tooling + spec):** `ARCHITECTURE.md`, source code under `src/`, `tests/`, `pyproject.toml`, `uv.lock`, `README.md`, and `config.example.toml`. These capture the brain's *behavior* and architecture.
+- **Derived brain content is user-private and ignored:** `50-sources/`, `90-wiki/`, `INDEX.md`, `.brain/state.json`, `.brain/changelog.jsonl`. This keeps each user's knowledge base local/private and avoids binary/generated churn in git. Recovery of derived content is via the `brain rebuild` command (§12.6) rather than `git checkout`.
+- **Commit cadence:** commit on the compaction pass, scoped to changed versioned project files only (spec, source, example config). No-op if only derived/ignored files changed.
+- **Ignore:** `.brain/embeddings.db` (+ `-journal`/`-wal`/`-shm`), `.brain/cache/`, `.brain/snapshots/`, `.brain/deadletter/`, `.brain/quarantine/`, `.env`, `*.local.toml`, `.slim/deepwork/`, OS/editor cruft.
+- **`config.toml` ignored** — contains the user's API key and model choices; use `config.example.toml` as the tracked template.
 - **`00-inbox/` ignored** (6a) — binary originals bloat `.git` forever; back up separately (OneDrive/rsync/etc.).
 
 ---
