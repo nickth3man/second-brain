@@ -464,19 +464,35 @@ async def extract(
         if plan.strategy == "direct":
             return await _try_body(model_name, attempt_n, plan.chunks[0])
 
+        total_chunks = len(plan.chunks)
         log.info(
             "extract.long_source.start",
             source_id=source_id,
             strategy=plan.strategy,
-            chunks=len(plan.chunks),
+            chunks=total_chunks,
         )
         outputs: list[LibrarianOutput] = []
         for idx, chunk in enumerate(plan.chunks, 1):
+            log.info(
+                "extract.chunk.start",
+                source_id=source_id,
+                strategy=plan.strategy,
+                chunk=idx,
+                total=total_chunks,
+            )
             wrapped = (
-                f"LONG SOURCE {plan.strategy.upper()} MAP CHUNK {idx}/{len(plan.chunks)}\n\n"
+                f"LONG SOURCE {plan.strategy.upper()} MAP CHUNK {idx}/{total_chunks}\n\n"
                 f"{chunk}"
             )
             outputs.append(await _try_body(model_name, attempt_n, wrapped))
+            log.info(
+                "extract.chunk.done",
+                source_id=source_id,
+                strategy=plan.strategy,
+                chunk=idx,
+                total=total_chunks,
+                topics_so_far=sum(len(o.topics) for o in outputs),
+            )
 
         if plan.strategy == "map_reduce":
             reduce_body = _outputs_to_reduce_markdown(
