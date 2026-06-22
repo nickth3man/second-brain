@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from second_brain.compact.dedup import cosine
+from second_brain.frontmatter import split_frontmatter
+from second_brain.vectors.store import _unpack
 
 
 def run_health_check(cfg: object, store: object) -> dict:  # noqa: ARG001
@@ -201,6 +206,52 @@ def _topic_source_cosine_mean(root: Path) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _get_topic_centroid(vec_store: object, slug: str) -> list[float] | None:
+    """Return the centroid vector for *slug*, or ``None`` if missing."""
+    row = vec_store.db.execute(
+        "SELECT m.rowid FROM topic_centroids_meta m WHERE m.slug = ?",
+        (slug,),
+    ).fetchone()
+    if row is None:
+        return None
+    blob_row = vec_store.db.execute(
+        "SELECT embedding FROM topic_centroids_vec WHERE rowid = ?",
+        (row["rowid"],),
+    ).fetchone()
+    if blob_row is None:
+        return None
+    return _unpack(blob_row["embedding"], vec_store.dim)
+
+
+def write_topic_source_cosine_metric(cfg: object, store: object, vec_store: object) -> None:
+    """Compute source-vs-topic centroid cosine similarities and persist L1 metric."""
+    root = getattr(cfg, "brain_root", None)
+    if root is None:
+        return
+
+    values: list[float] = []
+    for source_id, source in store.state.sources.items():
+        source_centroid = vec_store.source_centroid(source_id)
+        if source_centroid is None:
+            continue
+        for topic_slug in source.topics:
+            topic_centroid = _get_topic_centroid(vec_store, topic_slug)
+            if topic_centroid is None:
+                continue
+            values.append(cosine(source_centroid, topic_centroid))
+
+    eval_dir = root / ".brain" / "evals"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "values": values,
+        "updated": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    (eval_dir / "l1-topic-source-cosine.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _sampled_metrics(cfg: object, store: object) -> dict[str, float | None]:
     """Read sampled 7-day eval/cost metrics from changelog events."""
     root = getattr(cfg, "brain_root", None)
@@ -261,21 +312,30 @@ def _latest_higher_eval_metrics(cfg: object) -> dict[str, str]:
     }
 
 
-async def run_higher_level_evals(cfg: object, store: object, client: object | None = None) -> dict:
+async def run_higher_level_evals(
+    cfg: object,
+    store: object,
+    client: object | None = None,
+    *,
+    vec_store: object | None = None,
+    embedder: object | None = None,
+) -> dict:
     """Run/persist L2-L4 eval orchestration with provider work opt-in only."""
     eval_dir = cfg.brain_root / ".brain" / "evals"
     eval_dir.mkdir(parents=True, exist_ok=True)
+    if vec_store is not None:
+        write_topic_source_cosine_metric(cfg, store, vec_store)
     result = {
         "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "l2": _run_l2_self_consistency(store),
         "l3": {"status": "skipped", "reason": "set SECOND_BRAIN_RUN_LLM_EVALS=1 to enable"},
-        "l4": _run_l4_golden_set(cfg),
+        "l4": await _run_l4_golden_set(cfg, vec_store, embedder),
     }
     if os.environ.get("SECOND_BRAIN_RUN_LLM_EVALS") == "1":
         if client is None:
             result["l3"] = {"status": "skipped", "reason": "no eval client supplied"}
         else:
-            result["l3"] = await _run_l3_judge(cfg, client)
+            result["l3"] = await _run_l3_judge(cfg, store, client)
     (eval_dir / "latest.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
@@ -290,24 +350,178 @@ def _run_l2_self_consistency(store: object) -> dict:
     return {"status": "complete", "mismatches": mismatches, "score": 1.0 if not mismatches else 0.0}
 
 
-async def _run_l3_judge(cfg: object, client: object) -> dict:
+async def _run_l3_judge(cfg: object, store: object, client: object) -> dict:
     text_model = getattr(cfg.models, "text", "")
     judge_model = getattr(cfg.models, "judge", "")
+    if not judge_model:
+        return {"status": "skipped", "reason": "no judge model configured"}
     if _model_family(text_model) == _model_family(judge_model):
         return {"status": "skipped", "reason": "judge model must be cross-family"}
-    response = await client.chat_completion(
-        judge_model,
-        [{"role": "user", "content": "Return JSON: {\"score\": 1.0, \"notes\": \"ok\"}"}],
-        extra_body={"headers": {"X-OpenRouter-Cache": "true"}},
-    )
-    return {"status": "complete", "model": judge_model, "response": response}
+
+    pairs = _sample_faithfulness_pairs(cfg, store)
+    if not pairs:
+        return {"status": "skipped", "reason": "no content to judge"}
+
+    scores: list[float] = []
+    for wiki_synthesis, source_excerpt in pairs:
+        prompt = (
+            "You are a cross-family quality judge evaluating wiki synthesis "
+            "faithfulness to source material.\n\n"
+            "Score how faithfully the wiki synthesis reflects the source excerpt "
+            "on a 0-1 scale (1.0 = fully supported, 0.0 = unsupported or "
+            "contradicted).\n\n"
+            "Return JSON only: {\"score\": <float>, \"notes\": \"<brief reason>\"}\n\n"
+            f"Wiki synthesis:\n{wiki_synthesis}\n\n"
+            f"Source excerpt:\n{source_excerpt}"
+        )
+        response = await client.chat_completion(
+            judge_model,
+            [{"role": "user", "content": prompt}],
+            extra_body={"headers": {"X-OpenRouter-Cache": "true"}},
+        )
+        parsed = _parse_judge_score(response)
+        if parsed is not None:
+            scores.append(parsed)
+
+    if not scores:
+        return {"status": "skipped", "reason": "judge returned no parseable scores"}
+
+    mean_score = sum(scores) / len(scores)
+    return {
+        "status": "complete",
+        "model": judge_model,
+        "score": mean_score,
+        "samples": len(scores),
+    }
 
 
-def _run_l4_golden_set(cfg: object) -> dict:
-    golden_dir = cfg.brain_root / getattr(cfg.eval, "golden_set_dir", ".brain/golden")
-    if not golden_dir.exists() or not any(golden_dir.glob("*.json")):
+def _sample_faithfulness_pairs(cfg: object, store: object) -> list[tuple[str, str]]:
+    """Sample up to 3 (wiki synthesis, source excerpt) pairs from brain state."""
+    root = getattr(cfg, "brain_root", None)
+    if root is None:
+        return []
+
+    wiki_dir = root / "90-wiki"
+    source_dir = root / "50-sources"
+    pairs: list[tuple[str, str]] = []
+
+    for source_id, source in store.state.sources.items():
+        if not source.topics:
+            continue
+        source_path = source_dir / f"{source_id}.md"
+        if not source_path.is_file():
+            continue
+        try:
+            _meta, source_body = split_frontmatter(source_path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        source_excerpt = source_body.strip()[:1000]
+        if not source_excerpt:
+            continue
+
+        seen_topics: set[str] = set()
+        for topic_slug in source.topics:
+            if topic_slug in seen_topics:
+                continue
+            seen_topics.add(topic_slug)
+            wiki_path = wiki_dir / f"{topic_slug}.md"
+            if not wiki_path.is_file():
+                continue
+            try:
+                _wmeta, wiki_body = split_frontmatter(wiki_path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            synthesis = _extract_synthesis(wiki_body)[:2000]
+            if not synthesis.strip():
+                continue
+            pairs.append((synthesis, source_excerpt))
+
+    if len(pairs) <= 3:
+        return pairs
+    return random.sample(pairs, 3)
+
+
+def _extract_synthesis(wiki_body: str) -> str:
+    """Return the ``## Synthesis`` section body, or the full wiki body."""
+    lines = wiki_body.splitlines()
+    synthesis_lines: list[str] = []
+    in_synthesis = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## Synthesis"):
+            in_synthesis = True
+            continue
+        if in_synthesis and stripped.startswith("## "):
+            break
+        if in_synthesis:
+            synthesis_lines.append(line)
+    if synthesis_lines:
+        return "\n".join(synthesis_lines).strip()
+    return wiki_body.strip()
+
+
+def _parse_judge_score(response: object) -> float | None:
+    """Extract a 0-1 faithfulness score from a judge chat response."""
+    try:
+        if isinstance(response, dict):
+            content = response["choices"][0]["message"]["content"]
+        else:
+            return None
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    if not isinstance(content, str):
+        return None
+
+    match = re.search(r"\{[^{}]*\"score\"[^{}]*\}", content, re.DOTALL)
+    if match is None:
+        return None
+    try:
+        data = json.loads(match.group(0))
+        score = float(data["score"])
+    except (ValueError, TypeError, json.JSONDecodeError, KeyError):
+        return None
+    return max(0.0, min(1.0, score))
+
+
+async def _run_l4_golden_set(
+    cfg: object,
+    vec_store: object | None = None,
+    embedder: object | None = None,
+) -> dict:
+    eval_cfg = getattr(cfg, "eval", None)
+    _default = ".brain/golden"
+    golden_rel = getattr(eval_cfg, "golden_set_dir", _default) if eval_cfg else _default
+    golden_dir = cfg.brain_root / golden_rel
+    cases = list(golden_dir.glob("*.json")) if golden_dir.exists() else []
+    if not cases:
         return {"status": "skipped", "reason": "golden set is missing or empty"}
-    return {"status": "complete", "golden_cases": len(list(golden_dir.glob("*.json")))}
+    if vec_store is None or embedder is None:
+        return {"status": "skipped", "reason": "vec_store or embedder not available"}
+
+    passed = 0
+    for case_path in cases:
+        try:
+            case = json.loads(case_path.read_text(encoding="utf-8"))
+            query = case["query"]
+            expected_source_id = case["expected_source_id"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+        vectors = await embedder.embed_texts([query])
+        if not vectors:
+            continue
+        hits = vec_store.vector_search_chunks(vectors[0], k=5)
+        source_ids = [
+            chunk["source_id"]
+            for rowid, _sim in hits
+            if (chunk := vec_store.get_chunk(rowid)) is not None
+        ]
+        if expected_source_id in source_ids:
+            passed += 1
+
+    pass_rate = passed / len(cases)
+    return {"status": "complete", "golden_cases": len(cases), "pass_rate": pass_rate}
 
 
 def _model_family(model: str) -> str:

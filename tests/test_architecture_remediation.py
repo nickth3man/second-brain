@@ -441,6 +441,10 @@ async def test_vector_reconcile_repairs_index_drift(tmp_path: Path) -> None:
         assert report.fts_mismatches == ["source_chunks_fts"]
         assert report.stale_topic_centroids == ["topic-a"]
         assert report.tombstone_inconsistencies == ["note"]
+        remaining = vec_store.db.execute(
+            "SELECT source_id FROM vec_tombstones WHERE source_id = 'note'"
+        ).fetchall()
+        assert remaining == []
         assert vec_store.source_centroid("note") is not None
     finally:
         vec_store.close()
@@ -479,9 +483,96 @@ async def test_higher_level_evals_persist_and_surface_skip_status(tmp_path: Path
 
     assert result["l2"]["status"] == "complete"
     assert result["l3"]["status"] == "skipped"
+    assert result["l4"]["status"] == "skipped"
     assert (tmp_path / ".brain" / "evals" / "latest.json").exists()
     assert report["l2_status"] == "complete"
     assert "L3 judge" in md
+
+
+def test_topic_source_cosine_metric_written(tmp_path: Path) -> None:
+    from second_brain.compact.eval import (
+        _topic_source_cosine_mean,
+        write_topic_source_cosine_metric,
+    )
+    from second_brain.vectors.store import VectorStore
+
+    cfg = _cfg(tmp_path)
+    store = BrainStateStore.load(cfg)
+    store.state.sources["note"] = SourceState(
+        sha256="abc",
+        raw="00-inbox/note.txt",
+        topics=["topic-a"],
+    )
+    store.ensure_topic("topic-a", "Topic A")
+
+    vec_store = VectorStore(tmp_path / ".brain" / "embeddings.db", "test-model", dim=3)
+    vec_store.upsert_source_chunks(
+        "note",
+        "topic-a",
+        [("hello world", [1.0, 0.0, 0.0])],
+    )
+    vec_store.add_topic_member("topic-a", "note")
+    vec_store.upsert_topic_centroid("topic-a", [1.0, 0.0, 0.0], member_count=1)
+
+    try:
+        write_topic_source_cosine_metric(cfg, store, vec_store)
+        mean = _topic_source_cosine_mean(tmp_path)
+        assert mean is not None
+        assert mean == pytest.approx(1.0)
+    finally:
+        vec_store.close()
+
+
+async def test_l3_judge_skipped_when_no_content(tmp_path: Path) -> None:
+    from second_brain.compact.eval import _run_l3_judge
+
+    cfg = _cfg(tmp_path)
+    cfg.models = SimpleNamespace(
+        text="anthropic/claude-3.5-sonnet",
+        judge="openai/gpt-4o",
+    )
+    store = BrainStateStore.load(cfg)
+
+    result = await _run_l3_judge(cfg, store, object())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no content to judge"
+
+
+async def test_l4_golden_set_computes_pass_rate(tmp_path: Path) -> None:
+    import json
+
+    from second_brain.compact.eval import _run_l4_golden_set
+    from second_brain.vectors.store import VectorStore
+
+    cfg = _cfg(tmp_path)
+    cfg.eval = SimpleNamespace(golden_set_dir=".brain/golden")
+    golden_dir = tmp_path / ".brain" / "golden"
+    golden_dir.mkdir(parents=True)
+    (golden_dir / "case1.json").write_text(
+        json.dumps({"query": "hello world", "expected_source_id": "note"}),
+        encoding="utf-8",
+    )
+
+    vec_store = VectorStore(tmp_path / ".brain" / "embeddings.db", "test-model", dim=3)
+    vec_store.upsert_source_chunks(
+        "note",
+        "topic-a",
+        [("hello world text", [1.0, 0.0, 0.0])],
+    )
+
+    class FakeEmbedder:
+        async def embed_texts(self, texts):  # noqa: ANN001
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    try:
+        result = await _run_l4_golden_set(cfg, vec_store, FakeEmbedder())
+        assert result["status"] == "complete"
+        assert result["golden_cases"] == 1
+        assert "pass_rate" in result
+        assert result["pass_rate"] == 1.0
+    finally:
+        vec_store.close()
 
 
 def test_l1_hash_stability_metric(tmp_path: Path) -> None:

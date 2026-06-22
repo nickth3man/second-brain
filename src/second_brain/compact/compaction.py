@@ -165,6 +165,9 @@ async def run_compaction(
     """
     pairs = _topic_pairs_by_similarity(vec_store, store, merge_threshold)
     if not pairs:
+        from second_brain.compact.eval import write_topic_source_cosine_metric
+
+        write_topic_source_cosine_metric(cfg, store, vec_store)
         return {"merges": 0, "pairs": [], "merged_into": {}}
 
     merges = 0
@@ -309,6 +312,9 @@ async def run_compaction(
         merges += 1
 
     store.save()
+    from second_brain.compact.eval import write_topic_source_cosine_metric
+
+    write_topic_source_cosine_metric(cfg, store, vec_store)
     return {
         "merges": merges,
         "pairs": merged_pairs,
