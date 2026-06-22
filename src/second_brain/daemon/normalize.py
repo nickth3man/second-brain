@@ -106,6 +106,11 @@ async def normalize_text(
     else:
         body = await parse_to_markdown(path, stage, cfg, client)
 
+    if path.suffix.lower() == ".vtt":
+        from second_brain.parse.vtt import vtt_to_transcript
+
+        body = vtt_to_transcript(body)
+
     try:
         rel = path.resolve().relative_to(cfg.brain_root.resolve()).as_posix()
     except ValueError:

@@ -381,6 +381,33 @@ def _run_l2_self_consistency(store: object) -> dict:
     return {"status": "complete", "mismatches": mismatches, "score": 1.0 if not mismatches else 0.0}
 
 
+def _wiki_cites_source(wiki_body: str, source_id: str) -> bool:
+    """Return True if the wiki page's Sources section links to *source_id*."""
+    needle = f"../50-sources/{source_id}.md"
+    lines = wiki_body.splitlines()
+    in_sources = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "## Sources":
+            in_sources = True
+            continue
+        if in_sources and stripped.startswith("## "):
+            break
+        if in_sources and needle in line:
+            return True
+    return False
+
+
+def _is_prose_excerpt(excerpt: str) -> bool:
+    """Return False for spreadsheet/table summaries unsuitable for faithfulness judging."""
+    head = excerpt.strip()[:200].lower()
+    if head.startswith("## sheet:"):
+        return False
+    if head.startswith("| platform |") or head.startswith("| --- |"):
+        return False
+    return True
+
+
 async def _run_l3_judge(cfg: object, store: object, client: object) -> dict:
     text_model = getattr(cfg.models, "text", "")
     judge_model = getattr(cfg.models, "judge", "")
@@ -412,11 +439,16 @@ async def _run_l3_judge(cfg: object, store: object, client: object) -> dict:
             f"Wiki synthesis:\n{wiki_synthesis}\n\n"
             f"Source excerpt:\n{source_excerpt}"
         )
-        _reasoning, clean_content = await client.chat_completion_clean(
+        resp = await client.chat_completion(
             judge_model,
             [{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
-        parsed = _parse_judge_score(clean_content)
+        try:
+            content = resp["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            content = ""
+        parsed = _parse_judge_score(content)
         if parsed is not None:
             scores.append(parsed)
             raw_scores.append({"score": parsed, "synthesis_chars": len(wiki_synthesis)})
@@ -454,8 +486,8 @@ def _sample_faithfulness_pairs(cfg: object, store: object) -> list[tuple[str, st
             _meta, source_body = split_frontmatter(source_path.read_text(encoding="utf-8"))
         except OSError:
             continue
-        source_excerpt = source_body.strip()[:1000]
-        if not source_excerpt:
+        source_excerpt = source_body.strip()[:1500]
+        if not source_excerpt or not _is_prose_excerpt(source_excerpt):
             continue
 
         seen_topics: set[str] = set()
@@ -472,6 +504,10 @@ def _sample_faithfulness_pairs(cfg: object, store: object) -> list[tuple[str, st
                 continue
             synthesis = _extract_synthesis(wiki_body)[:2000]
             if not synthesis.strip():
+                continue
+            if synthesis.strip().startswith(">") or len(synthesis.strip()) < 50:
+                continue
+            if not _wiki_cites_source(wiki_body, source_id):
                 continue
             pairs.append((synthesis, source_excerpt))
 

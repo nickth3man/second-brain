@@ -750,7 +750,9 @@ async def test_l3_judge_scores_with_mock_client(tmp_path: Path) -> None:
                 "created": "2026-06-22",
                 "updated": "2026-06-22",
             },
-            "# Topic A\n\n## Synthesis\nThe Los Angeles Lakers won the 2009 title.\n\n## Sources\n",
+            "# Topic A\n\n## Synthesis\nThe Los Angeles Lakers won the 2009 NBA championship title.\n\n## Sources\n"
+                "- **[2026-06-22]** Note\n"
+                "  -> [source](../50-sources/note.md)\n",
         ),
         encoding="utf-8",
     )
@@ -764,8 +766,12 @@ async def test_l3_judge_scores_with_mock_client(tmp_path: Path) -> None:
     store.ensure_topic("topic-a", "Topic A")
 
     class MockClient:
-        async def chat_completion_clean(self, model, messages, **kwargs):  # noqa: ANN001, ARG002
-            return (None, '{"score": 0.9, "notes": "well grounded"}')
+        async def chat_completion(self, model, messages, **kwargs):  # noqa: ANN001, ARG002
+            return {
+                "choices": [
+                    {"message": {"content": '{"score": 0.9, "notes": "well grounded"}'}}
+                ]
+            }
 
     result = await _run_l3_judge(cfg, store, MockClient())
 
@@ -861,3 +867,284 @@ def test_citation_format_pass_rate_misses_missing_link(tmp_path: Path) -> None:
 
     rate = _citation_format_pass_rate(tmp_path)
     assert rate == pytest.approx(0.0)
+
+
+def test_vtt_to_transcript_strips_timing_and_deduplicates() -> None:
+    from second_brain.parse.vtt import vtt_to_transcript
+
+    raw = """WEBVTT
+Kind: captions
+Language: en
+
+00:00:00.640 --> 00:00:02.000 align:start
+<c>Hello</c> <00:00:01.000><c>world</c>
+
+00:00:02.000 --> 00:00:03.500 align:start
+Hello world
+
+00:00:03.500 --> 00:00:05.000 align:start
+Hello world
+
+00:00:05.000 --> 00:00:07.000 align:start
+Next sentence here
+"""
+    transcript = vtt_to_transcript(raw)
+
+    assert "-->" not in transcript
+    assert "<c>" not in transcript
+    assert "WEBVTT" not in transcript
+    assert transcript.count("Hello world") == 1
+    assert "Next sentence here" in transcript
+
+
+async def test_compaction_updates_source_frontmatter_on_merge(tmp_path: Path) -> None:
+    from second_brain.compact.compaction import run_compaction
+    from second_brain.compact.eval import _run_l2_self_consistency
+    from second_brain.vectors.store import VectorStore
+
+    cfg = _cfg(tmp_path)
+    cfg.models = SimpleNamespace(text="test-model", judge="test-judge")
+    cfg.ingestion = SimpleNamespace(merge_threshold=0.85)
+
+    for sub in ("50-sources", "90-wiki", ".brain"):
+        (tmp_path / sub).mkdir(parents=True, exist_ok=True)
+
+    store = BrainStateStore.load(cfg)
+    store.ensure_topic("topic-a", "Topic A")
+    store.ensure_topic("topic-b", "Topic B")
+    store.add_source_to_topic("topic-a", "src-a1")
+    store.add_source_to_topic("topic-b", "src-b1")
+    store.state.sources["src-a1"] = SourceState(
+        sha256="aaa",
+        raw="00-inbox/a.txt",
+        topics=["topic-a"],
+    )
+    store.state.sources["src-b1"] = SourceState(
+        sha256="bbb",
+        raw="00-inbox/b.txt",
+        topics=["topic-b"],
+    )
+
+    (tmp_path / "50-sources" / "src-a1.md").write_text(
+        dump_frontmatter(
+            {
+                "source": "00-inbox/a.txt",
+                "type": "text",
+                "ingested": "2026-06-22T00:00:00Z",
+                "sha256": "aaa",
+                "topics": ["topic-a"],
+            },
+            "Source A body.",
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "50-sources" / "src-b1.md").write_text(
+        dump_frontmatter(
+            {
+                "source": "00-inbox/b.txt",
+                "type": "text",
+                "ingested": "2026-06-22T00:00:00Z",
+                "sha256": "bbb",
+                "topics": ["topic-b"],
+            },
+            "Source B body.",
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "90-wiki" / "topic-a.md").write_text(
+        dump_frontmatter(
+            {
+                "title": "Topic A",
+                "type": "concept",
+                "created": "2026-06-22",
+                "updated": "2026-06-22",
+            },
+            "# Topic A\n\n## Synthesis\nOriginal A synthesis with enough content.\n",
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "90-wiki" / "topic-b.md").write_text(
+        dump_frontmatter(
+            {
+                "title": "Topic B",
+                "type": "concept",
+                "created": "2026-06-22",
+                "updated": "2026-06-22",
+            },
+            "# Topic B\n\n## Synthesis\nOriginal B synthesis with enough content.\n",
+        ),
+        encoding="utf-8",
+    )
+
+    vec_store = VectorStore(tmp_path / ".brain" / "embeddings.db", "test-model", dim=8)
+    vec_a = [1.0] + [0.0] * 7
+    vec_b = [0.99, 0.141] + [0.0] * 6
+    vec_store.upsert_source_chunks("src-a1", "topic-a", [("text a1", vec_a)])
+    vec_store.upsert_source_chunks("src-a2", "topic-a", [("text a2", vec_a)])
+    vec_store.upsert_source_chunks("src-b1", "topic-b", [("text b1", vec_b)])
+    store.add_source_to_topic("topic-a", "src-a2")
+    store.state.sources["src-a2"] = SourceState(
+        sha256="aac",
+        raw="00-inbox/a2.txt",
+        topics=["topic-a"],
+    )
+    vec_store.add_topic_member("topic-a", "src-a1")
+    vec_store.add_topic_member("topic-a", "src-a2")
+    vec_store.add_topic_member("topic-b", "src-b1")
+    vec_store.recompute_centroid("topic-a")
+    vec_store.recompute_centroid("topic-b")
+
+    class MergeClient:
+        async def chat_completion_clean(self, model, messages, **kwargs):  # noqa: ANN001, ARG002
+            return (None, "Merged synthesis content with enough valid text for validation.")
+
+    try:
+        summary = await run_compaction(
+            cfg,
+            store,
+            vec_store,
+            MergeClient(),
+            merge_threshold=0.85,
+        )
+        assert summary["merges"] == 1
+
+        b_meta, _ = split_frontmatter(
+            (tmp_path / "50-sources" / "src-b1.md").read_text(encoding="utf-8")
+        )
+        assert b_meta["topics"] == ["topic-a"]
+        assert store.state.sources["src-b1"].topics == ["topic-a"]
+
+        l2 = _run_l2_self_consistency(store)
+        assert l2["score"] == 1.0
+        assert l2["mismatches"] == []
+    finally:
+        vec_store.close()
+
+
+def test_l3_pairing_skips_redirect_pages(tmp_path: Path) -> None:
+    from second_brain.compact.eval import _sample_faithfulness_pairs
+    from second_brain.models import SourceState
+
+    cfg = _cfg(tmp_path)
+    source_dir = tmp_path / "50-sources"
+    wiki_dir = tmp_path / "90-wiki"
+    source_dir.mkdir(parents=True)
+    wiki_dir.mkdir(parents=True)
+
+    (source_dir / "note.md").write_text(
+        dump_frontmatter(
+            {
+                "source": "00-inbox/note.txt",
+                "type": "text",
+                "ingested": "2026-06-22T00:00:00Z",
+                "sha256": "abc",
+                "topics": ["topic-redirect", "topic-good"],
+            },
+            "Actual source body about basketball.",
+        ),
+        encoding="utf-8",
+    )
+    (wiki_dir / "topic-redirect.md").write_text(
+        dump_frontmatter(
+            {
+                "title": "Redirect",
+                "type": "concept",
+                "created": "2026-06-22",
+                "updated": "2026-06-22",
+            },
+            "# Redirect\n\n## Synthesis\n> Merged into [[topic-good]]\n",
+        ),
+        encoding="utf-8",
+    )
+    (wiki_dir / "topic-good.md").write_text(
+        dump_frontmatter(
+            {
+                "title": "Good Topic",
+                "type": "concept",
+                "created": "2026-06-22",
+                "updated": "2026-06-22",
+            },
+            (
+                "# Good Topic\n\n"
+                "## Synthesis\n"
+                "The Lakers won the 2009 NBA championship with strong defense.\n\n"
+                "## Sources\n"
+                "- **[2026-06-22]** Note\n"
+                "  -> [source](../50-sources/note.md)\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    store = BrainStateStore.load(cfg)
+    store.state.sources["note"] = SourceState(
+        sha256="abc",
+        raw="00-inbox/note.txt",
+        topics=["topic-redirect", "topic-good"],
+    )
+    store.ensure_topic("topic-redirect", "Redirect")
+    store.ensure_topic("topic-good", "Good Topic")
+
+    pairs = _sample_faithfulness_pairs(cfg, store)
+
+    assert len(pairs) == 1
+    assert "Lakers" in pairs[0][0]
+    assert pairs[0][1].startswith("Actual source body")
+
+
+def test_l3_pairing_strips_frontmatter_from_excerpt(tmp_path: Path) -> None:
+    from second_brain.compact.eval import _sample_faithfulness_pairs
+    from second_brain.models import SourceState
+
+    cfg = _cfg(tmp_path)
+    source_dir = tmp_path / "50-sources"
+    wiki_dir = tmp_path / "90-wiki"
+    source_dir.mkdir(parents=True)
+    wiki_dir.mkdir(parents=True)
+
+    (source_dir / "note.md").write_text(
+        dump_frontmatter(
+            {
+                "source": "00-inbox/note.txt",
+                "type": "text",
+                "ingested": "2026-06-22T00:00:00Z",
+                "sha256": "abc",
+                "topics": ["topic-a"],
+            },
+            "Body prose starts here without YAML headers.",
+        ),
+        encoding="utf-8",
+    )
+    (wiki_dir / "topic-a.md").write_text(
+        dump_frontmatter(
+            {
+                "title": "Topic A",
+                "type": "concept",
+                "created": "2026-06-22",
+                "updated": "2026-06-22",
+            },
+            (
+                "# Topic A\n\n"
+                "## Synthesis\n"
+                "Body prose starts here without YAML headers in the wiki synthesis too.\n\n"
+                "## Sources\n"
+                "- **[2026-06-22]** Note\n"
+                "  -> [source](../50-sources/note.md)\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    store = BrainStateStore.load(cfg)
+    store.state.sources["note"] = SourceState(
+        sha256="abc",
+        raw="00-inbox/note.txt",
+        topics=["topic-a"],
+    )
+    store.ensure_topic("topic-a", "Topic A")
+
+    pairs = _sample_faithfulness_pairs(cfg, store)
+
+    assert len(pairs) == 1
+    assert not pairs[0][1].startswith("---")
+    assert pairs[0][1].startswith("Body prose starts here")

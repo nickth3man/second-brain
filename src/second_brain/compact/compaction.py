@@ -98,6 +98,25 @@ def _topic_pairs_by_similarity(
 # Synthesis rewrite
 # ---------------------------------------------------------------------------
 
+_REFUSAL_MARKERS = (
+    "didn't come through",
+    "could you please",
+    "don't see any content",
+    "no content was provided",
+    "i don't have",
+    "please provide",
+    "please share",
+    "can you paste",
+)
+
+
+def _is_valid_synthesis(text: str) -> bool:
+    """Return True if the LLM returned a real synthesis rather than a refusal."""
+    if len(text.strip()) < 80:
+        return False
+    lower = text.lower()
+    return not any(marker in lower for marker in _REFUSAL_MARKERS)
+
 
 async def _rewrite_synthesis(
     client: object,
@@ -121,6 +140,9 @@ async def _rewrite_synthesis(
         path_b.read_text(encoding="utf-8") if path_b.exists() else ""
     )
 
+    if not synthesis_a.strip() and not synthesis_b.strip():
+        return ""
+
     prompt = (
         "You are merging two wiki topic pages. Produce a single unified "
         "## Synthesis section (markdown) that integrates both, removing "
@@ -131,7 +153,28 @@ async def _rewrite_synthesis(
         cfg.models.text,
         [{"role": "user", "content": prompt}],
     )
+    if not _is_valid_synthesis(clean_content):
+        return synthesis_a if len(synthesis_a) >= len(synthesis_b) else synthesis_b
     return clean_content
+
+
+def _sync_source_topic_membership(cfg: object, store: object) -> None:
+    """Ensure each source's ``topics`` list matches topic ``sources`` membership."""
+    for slug, topic in store.state.topics.items():
+        for source_id in topic.sources:
+            source_obj = store.state.sources.get(source_id)
+            if source_obj is None or slug in source_obj.topics:
+                continue
+            source_obj.topics.append(slug)
+            source_path = cfg.brain_root / "50-sources" / f"{source_id}.md"
+            if not source_path.is_file():
+                continue
+            meta, body = split_frontmatter(source_path.read_text(encoding="utf-8"))
+            topics = list(meta.get("topics", []))
+            if slug not in topics:
+                topics.append(slug)
+                meta["topics"] = topics
+                write_atomic(source_path, dump_frontmatter(meta, body))
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +208,11 @@ async def run_compaction(
     """
     pairs = _topic_pairs_by_similarity(vec_store, store, merge_threshold)
     if not pairs:
+        _sync_source_topic_membership(cfg, store)
         from second_brain.compact.eval import write_topic_source_cosine_metric
 
         write_topic_source_cosine_metric(cfg, store, vec_store)
+        store.save()
         return {"merges": 0, "pairs": [], "merged_into": {}}
 
     merges = 0
@@ -197,6 +242,30 @@ async def run_compaction(
         for src in topic_b.sources:
             if src not in topic_a.sources:
                 topic_a.sources.append(src)
+
+        # -- update source front-matter topics (slug_b -> slug_a) ----
+        merged_sources = list(topic_b.sources)
+        for src_id in merged_sources:
+            source_obj = store.state.sources.get(src_id)
+            if source_obj is None:
+                continue
+            if slug_b in source_obj.topics:
+                source_obj.topics = [
+                    slug_a if t == slug_b else t for t in source_obj.topics
+                ]
+            source_path = cfg.brain_root / "50-sources" / f"{src_id}.md"
+            if source_path.is_file():
+                meta, body = split_frontmatter(
+                    source_path.read_text(encoding="utf-8")
+                )
+                topics = meta.get("topics", [])
+                if slug_b in topics:
+                    meta["topics"] = [
+                        slug_a if t == slug_b else t for t in topics
+                    ]
+                    write_atomic(source_path, dump_frontmatter(meta, body))
+
+        topic_b.sources.clear()
 
         # -- merge links_to (union, avoid self-link) -----------------
         for link in topic_b.links_to:
@@ -247,7 +316,7 @@ async def run_compaction(
         topic_b.updated = now
 
         # -- move vec_store memberships and recompute centroid -------
-        for src in topic_b.sources:
+        for src in merged_sources:
             vec_store.add_topic_member(slug_a, src)
         vec_store.recompute_centroid(slug_a)
 
@@ -262,7 +331,7 @@ async def run_compaction(
         # -- rewrite a's synthesis via LLM ---------------------------
         new_synthesis = await _rewrite_synthesis(client, cfg, slug_a, slug_b, store)
         a_path = _topic_page_path(cfg, slug_a)
-        if a_path.exists():
+        if new_synthesis and a_path.exists():
             a_meta, a_body = split_frontmatter(
                 a_path.read_text(encoding="utf-8")
             )
@@ -311,6 +380,7 @@ async def run_compaction(
         merged_into[slug_b] = slug_a
         merges += 1
 
+    _sync_source_topic_membership(cfg, store)
     store.save()
     from second_brain.compact.eval import write_topic_source_cosine_metric
 

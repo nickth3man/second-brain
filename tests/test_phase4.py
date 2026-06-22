@@ -116,7 +116,14 @@ class FakeClient:
     def __init__(self, payload: dict | None = None):
         self.payload = payload or {
             "choices": [
-                {"message": {"content": "Merged synthesis content."}}
+                {
+                    "message": {
+                        "content": (
+                            "Merged synthesis content integrating both topics with "
+                            "enough detail to pass validation gates."
+                        )
+                    }
+                }
             ]
         }
 
