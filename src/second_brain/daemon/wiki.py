@@ -124,10 +124,19 @@ def merge_into_topic(
 
     # Update front-matter
     meta["updated"] = dt
-    meta["source_count"] = int(meta.get("source_count", 0)) + 1
-    meta["confidence"] = max(
-        float(meta.get("confidence", 0.0)), decision.confidence
-    )
+    existing_count = int(meta.get("source_count", 0))
+    new_count = existing_count + 1
+    existing_conf = float(meta.get("confidence", 0.0))
+    # Weighted mean: existing topics weighted by their source_count, new
+    # source weighted by 1 (§4.2/§11 aggregate confidence; mirrors the
+    # weighted-mean formula in compact/compaction.py).
+    meta["source_count"] = new_count
+    if existing_count > 0:
+        meta["confidence"] = (
+            (existing_conf * existing_count + decision.confidence) / new_count
+        )
+    else:
+        meta["confidence"] = decision.confidence
 
     write_atomic(path, dump_frontmatter(meta, body))
 

@@ -495,7 +495,7 @@ class TestPipeline:
 
         meta, _ = split_frontmatter(tc_text)
         assert meta.get("source_count") == 2
-        assert meta.get("confidence") == 0.85  # max of 0.5 and 0.85
+        assert meta.get("confidence") == 0.675  # weighted mean of 0.5 (1 src) and 0.85
 
     @pytest.mark.asyncio
     async def test_extract_failure_pipeline(self, tmp_path: Path) -> None:

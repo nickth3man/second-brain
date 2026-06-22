@@ -126,6 +126,7 @@ class SourceState(BaseModel):
 
     sha256: str
     topics: list[str] = []
+    near_duplicates: list[str] = []
     raw: str
     embedding_model: str | None = None
     stage: IngestStage = IngestStage.SEEN

@@ -25,6 +25,8 @@ from pathlib import Path
 
 import structlog
 
+from second_brain.atomicio import write_atomic
+from second_brain.compact.dedup import find_near_duplicates_for_source
 from second_brain.config import Config
 from second_brain.daemon.extract import ConfidenceFloorError, ExtractionError, extract
 from second_brain.daemon.index import DebouncedIndex
@@ -38,6 +40,7 @@ from second_brain.daemon.normalize import (
 from second_brain.daemon.router import route
 from second_brain.daemon.watcher import InboxWatcher
 from second_brain.daemon.wiki import merge_into_topic, write_new_topic
+from second_brain.frontmatter import dump_frontmatter, split_frontmatter
 from second_brain.models import IngestStage, PageType, SourceState, TopicAction
 from second_brain.openrouter_client import (
     CreditExhaustedError,
@@ -115,6 +118,23 @@ def _fail_file_safe(
 
 
 # -- per-file pipeline --------------------------------------------------------
+
+
+def _update_source_topics(cfg: Config, source_id: str, topic_slugs: list[str]) -> None:
+    """Re-write the source file's ``topics:`` front-matter after linking.
+
+    ``daemon/normalize.py`` writes ``topics: []`` and the pipeline never
+    updated the source markdown file.  This re-reads ``50-sources/<id>.md``,
+    sets its front-matter ``topics`` field to the link decisions' target
+    slugs, and atomically rewrites it.  Silently no-ops if the file is gone.
+    """
+    src_path = cfg.brain_root / "50-sources" / f"{source_id}.md"
+    if not src_path.exists():
+        return
+    text = src_path.read_text(encoding="utf-8")
+    meta, body = split_frontmatter(text)
+    meta["topics"] = list(topic_slugs)
+    write_atomic(src_path, dump_frontmatter(meta, body))
 
 
 async def ingest_file(
@@ -396,6 +416,53 @@ async def ingest_file(
                 source_id, decisions[0].target_slug, source_chunks
             )
 
+        # -- Phase 2.1: Near-duplicate detection (§11, passive surfacing) -
+        # Compare this source's representative embedding (mean of its chunk
+        # embeddings) against every existing source's representative
+        # embedding.  O(n) per ingest.  No auto-merge — passive surfacing
+        # + cross-link only.
+        if embedder is not None and vec_store is not None and source_chunks:
+            chunk_vecs = [v for _, v in source_chunks]
+            _n = len(chunk_vecs)
+            _dim = len(chunk_vecs[0]) if _n else 0
+            source_embedding: list[float] = (
+                [sum(v[d] for v in chunk_vecs) / _n for d in range(_dim)]
+                if _n
+                else []
+            )
+            if source_embedding:
+                try:
+                    hits = await find_near_duplicates_for_source(
+                        cfg, store, embedder, source_id, source_embedding,
+                        threshold=0.95,
+                    )
+                except Exception as exc:  # passive: never fail ingest on ndup
+                    hits = []
+                    log.warning(
+                        "pipeline.near_dup_failed",
+                        source_id=source_id, error=str(exc),
+                    )
+                if hits:
+                    log.info(
+                        "pipeline.near_dup_detected",
+                        source_id=source_id,
+                        near_duplicates=[
+                            (sid, round(sim, 4)) for sid, sim in hits[:5]
+                        ],
+                        n=len(hits),
+                    )
+                    store.state.sources[source_id].near_duplicates = [
+                        sid for sid, _ in hits
+                    ]
+                    store.append_changelog(
+                        {
+                            "kind": "ingest",
+                            "action": "near_dup_detected",
+                            "source": source_id,
+                            "near_duplicates": [sid for sid, _ in hits],
+                        }
+                    )
+
         # -- Stage 5: Wiki update -------------------------------------
         t_stage = time.perf_counter()
         store.transition(source_id, IngestStage.WIKI_MERGED)
@@ -445,6 +512,11 @@ async def ingest_file(
                 linked_slug = slugify(m.strip())
                 if linked_slug in store.state.topics:
                     store.record_link(decision.target_slug, linked_slug)
+
+        # Re-write the source file's ``topics:`` front-matter now that all
+        # link decisions are final (P2.2).  ``normalize`` wrote ``topics: []``
+        # and the pipeline never updated the source markdown before this.
+        _update_source_topics(cfg, source_id, [d.target_slug for d in decisions])
 
         # Recompute centroids for all affected topics
         if vec_store is not None:

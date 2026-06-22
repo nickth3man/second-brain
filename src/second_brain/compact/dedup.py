@@ -17,6 +17,7 @@ References
 
 from __future__ import annotations
 
+import hashlib
 import math
 
 import numpy as np
@@ -86,3 +87,55 @@ async def find_near_duplicates(
 
     pairs.sort(key=lambda x: x[2], reverse=True)
     return pairs
+
+
+# Module-level in-process cache of per-source representative embeddings.
+# Keyed on ``(source_id, sha256)`` where the sha is the SHA-256 of the
+# source file body, so any re-write of the source file (which changes its
+# sha) invalidates the cached embedding automatically.
+_SOURCE_EMBEDDING_CACHE: dict[tuple[str, str], list[float]] = {}
+
+
+async def find_near_duplicates_for_source(
+    cfg,
+    store,
+    embedder,
+    new_source_id: str,
+    new_embedding: list[float],
+    threshold: float = 0.95,
+) -> list[tuple[str, float]]:
+    """Find existing sources that are near-duplicates of *new_source*.
+
+    Compares the new source's embedding against every existing source's
+    chunk-mean embedding (read from the vector store or re-embedded from
+    50-sources/). Returns ``[(existing_source_id, cosine_similarity), ...]``
+    for every existing source with similarity >= *threshold*, sorted
+    descending. O(n) per ingest — suitable for the per-file pipeline.
+    """
+    hits: list[tuple[str, float]] = []
+    for sid in store.state.sources:
+        if sid == new_source_id:
+            continue
+        src_path = cfg.brain_root / "50-sources" / f"{sid}.md"
+        if not src_path.exists():
+            continue
+        try:
+            text = src_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        cache_key = (sid, digest)
+        existing_vec = _SOURCE_EMBEDDING_CACHE.get(cache_key)
+        if existing_vec is None:
+            try:
+                existing_vec = await embedder.embed_one(text)
+            except Exception:
+                # Skip sources that cannot be embedded rather than failing
+                # the whole ingest — near-dup surfacing is passive (§11).
+                continue
+            _SOURCE_EMBEDDING_CACHE[cache_key] = existing_vec
+        sim = cosine(new_embedding, existing_vec)
+        if sim >= threshold:
+            hits.append((sid, sim))
+    hits.sort(key=lambda x: x[1], reverse=True)
+    return hits

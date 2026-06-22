@@ -204,8 +204,8 @@ def compact() -> None:
     """Run one compaction pass (Phase 4 — merge similar topics)."""
 
     async def _compact() -> None:
+        from second_brain.compact.eval import run_health_check
         from second_brain.compact.compaction import run_compaction
-        from second_brain.compact.eval import render_health_markdown, run_health_check
         from second_brain.openrouter_client import OpenRouterClient
         from second_brain.state import BrainStateStore
         from second_brain.vectors.embed import Embedder
@@ -229,17 +229,12 @@ def compact() -> None:
                 merge_threshold=cfg.compaction.merge_threshold,
             )
 
+            # NOTE: the INDEX.md "## Brain Health" section is now rendered by
+            # ``DebouncedIndex._flush()`` on every flush (P2.3), so we no
+            # longer append it here — the debounced flush (or the next
+            # ingest's flush) regenerates INDEX.md from scratch and would
+            # erase anything we appended anyway.
             report = run_health_check(cfg, store)
-            health_md = render_health_markdown(report)
-
-            # Append health section to INDEX.md
-            index_path = cfg.brain_root / "INDEX.md"
-            if index_path.exists():
-                text = index_path.read_text(encoding="utf-8")
-                text += "\n\n" + health_md
-                from second_brain.atomicio import write_atomic
-
-                write_atomic(index_path, text)
 
             typer.echo(f"Compaction complete: {summary['merges']} merges.")
             for a, b, sim in summary["pairs"]:

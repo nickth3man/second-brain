@@ -86,6 +86,18 @@ class DebouncedIndex:
                 )
 
         content = "".join(lines)
+
+        # P2.3: append a Brain Health section computed from the current
+        # state.  ``_flush`` rewrites INDEX.md from scratch, so any health
+        # markdown appended by ``brain compact`` would be erased on the next
+        # flush; rendering it here keeps it always fresh.  Lazy import to
+        # avoid a circular import at module load time.
+        from second_brain.compact.eval import render_health_markdown, run_health_check
+
+        report = run_health_check(self.cfg, self.store)
+        health_md = render_health_markdown(report)
+        content = content + "\n\n" + health_md
+
         write_atomic(self.cfg.brain_root / "INDEX.md", content)
 
     async def flush_now(self) -> None:
