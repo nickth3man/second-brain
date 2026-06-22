@@ -1,12 +1,13 @@
 """One-shot live eval runner. Run after ingestion + compaction."""
-import asyncio, json, os
-from pathlib import Path
+import asyncio
+import json
+import os
 
 os.environ["SECOND_BRAIN_RUN_LLM_EVALS"] = "1"
 
 async def main() -> None:
-    from second_brain.config import load_config
     from second_brain.compact.eval import run_higher_level_evals
+    from second_brain.config import load_config
     from second_brain.openrouter_client import OpenRouterClient
     from second_brain.state import BrainStateStore
     from second_brain.vectors.embed import Embedder

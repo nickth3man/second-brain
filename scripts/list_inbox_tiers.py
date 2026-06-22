@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 inbox_dir = Path("00-inbox")
@@ -6,7 +5,7 @@ files = list(inbox_dir.glob("*"))
 
 tier1_exts = {".vtt", ".csv", ".xlsx", ".md", ".txt", ".mdc"}
 tier2_exts = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".webp"}
-tier3_exts = {".mp4", ".mov", ".mov", ".mkv", ".webm", ".avi", ".mp3", ".m4a", ".wav"}
+tier3_exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".mp3", ".m4a", ".wav"}
 
 tier1 = []
 tier2 = []

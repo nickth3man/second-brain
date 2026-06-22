@@ -1,6 +1,9 @@
 from pathlib import Path
 
-mdc_files = ["codequality.mdc", "database.mdc", "nextjs.mdc", "python.mdc", "tailwind.mdc", "typescript.mdc"]
+mdc_files = [
+    "codequality.mdc", "database.mdc", "nextjs.mdc",
+    "python.mdc", "tailwind.mdc", "typescript.mdc",
+]
 
 for name in mdc_files:
     dl = Path(".brain/deadletter") / name

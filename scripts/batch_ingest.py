@@ -1,5 +1,5 @@
-import sys
 import subprocess
+import sys
 from pathlib import Path
 
 # Reconfigure stdout to use UTF-8 to prevent encoding errors on Windows
@@ -53,20 +53,24 @@ failed_count = 0
 for idx, f in enumerate(target_files, 1):
     print(f"\n[{idx}/{len(target_files)}] Ingesting: {f.name}")
     try:
-        # Run uv run brain ingest "<path>"
-        result = subprocess.run(
+        # Stream output in real time so we can see what's happening
+        proc = subprocess.Popen(
             ["uv", "run", "brain", "ingest", str(f)],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            bufsize=1,
         )
-        print(result.stdout)
-        if result.stderr:
-            print("Stderr output:")
-            print(result.stderr)
-        
-        if result.returncode == 0 and "failed" not in result.stdout.lower():
+        output_lines = []
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+        proc.wait()
+        combined = "".join(output_lines)
+
+        if proc.returncode == 0 and "failed" not in combined.lower():
             success_count += 1
         else:
             failed_count += 1

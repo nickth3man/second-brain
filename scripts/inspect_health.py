@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+
 from second_brain.config import load_config
 from second_brain.state import BrainStateStore
 
@@ -38,7 +39,8 @@ for p in sorted(pages):
 print(f"  Pages with no '## Sources' section: {len(no_sources_section)}")
 for s in no_sources_section[:10]:
     print(f"    - {s}")
-print(f"  Pages with '## Sources' but no properly formatted source links: {len(has_sources_no_links)}")
+no_link_count = len(has_sources_no_links)
+print(f"  Pages with '## Sources' but no properly formatted source links: {no_link_count}")
 for s in has_sources_no_links[:10]:
     print(f"    - {s}")
 
