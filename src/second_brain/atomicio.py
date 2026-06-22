@@ -45,7 +45,15 @@ def write_atomic(path: Path, data: str | bytes, *, text_mode: bool = True) -> No
                 f.write(data.encode("utf-8"))
                 f.flush()
                 os.fsync(f.fileno())
-        os.replace(tmp, path)
+        import time
+        for i in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if i == 4:
+                    raise
+                time.sleep(0.1)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise

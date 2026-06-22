@@ -102,14 +102,24 @@ def _render_stage_table(progress: list[dict]) -> None:
     An empty ``model`` string renders as a blank cell (not ``None``).
     Rows are printed in the order they appear in ``progress``.
     """
-    typer.echo(f"{'Stage':<12}{'Model':<30}{'Status':<7}Notes")
-    typer.echo("-" * 60)
-    for row in progress:
-        stage = str(row.get("stage", ""))
-        model = row.get("model") or ""
-        status = str(row.get("status", ""))
-        notes = row.get("notes") or ""
-        typer.echo(f"{stage:<12}{model:<30}{status:<7}{notes}")
+    try:
+        typer.echo(f"{'Stage':<12}{'Model':<30}{'Status':<7}Notes")
+        typer.echo("-" * 60)
+        for row in progress:
+            stage = str(row.get("stage", ""))
+            model = row.get("model") or ""
+            status = str(row.get("status", ""))
+            notes = row.get("notes") or ""
+            typer.echo(f"{stage:<12}{model:<30}{status:<7}{notes}")
+    except UnicodeEncodeError:
+        typer.echo(f"{'Stage':<12}{'Model':<30}{'Status':<7}Notes")
+        typer.echo("-" * 60)
+        for row in progress:
+            stage = str(row.get("stage", ""))
+            model = row.get("model") or ""
+            status = str(row.get("status", ""))
+            notes = str(row.get("notes") or "").encode('ascii', errors='replace').decode('ascii')
+            typer.echo(f"{stage:<12}{model:<30}{status:<7}{notes}")
 
 
 @app.command()
@@ -158,7 +168,10 @@ def ingest(
             await client.close()
 
     stage, progress = asyncio.run(_ingest_one())
-    typer.echo(f"{path.name}: {stage}")
+    try:
+        typer.echo(f"{path.name}: {stage}")
+    except UnicodeEncodeError:
+        typer.echo(f"{path.name.encode('ascii', errors='replace').decode('ascii')}: {stage}")
     if progress:
         typer.echo("")
         _render_stage_table(progress)
