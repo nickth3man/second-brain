@@ -16,6 +16,7 @@ from pathlib import Path
 
 import fitz
 
+from second_brain.atomicio import write_atomic
 from second_brain.config import Config
 from second_brain.openrouter_client import OpenRouterClient
 
@@ -25,7 +26,7 @@ def _progress_path(cfg: Config, sha: str) -> Path:
 
     Args:
         cfg: App configuration (used for ``brain_root``).
-        sha: First 16 hex chars of the file SHA-256.
+        sha: Full SHA-256 hex digest of the file.
 
     Returns:
         Path to ``.brain/cache/{sha}.progress.json``.
@@ -74,7 +75,7 @@ async def parse_pdf(path: Path, cfg: Config, client: OpenRouterClient) -> str:
         double newlines.  (Pages already marked done in the progress file
         are skipped; the caller is responsible for combining partial runs.)
     """
-    sha = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
     progress_path = _progress_path(cfg, sha)
 
     done: set[int] = set()
@@ -105,7 +106,7 @@ async def parse_pdf(path: Path, cfg: Config, client: OpenRouterClient) -> str:
         # Checkpoint progress after every page (§12.3)
         done.add(i)
         progress_path.parent.mkdir(parents=True, exist_ok=True)
-        progress_path.write_text(json.dumps(sorted(done)))
+        write_atomic(progress_path, json.dumps(sorted(done)))
 
     doc.close()
     return "\n\n".join(pages_text)

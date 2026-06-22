@@ -10,7 +10,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 # -- section models ----------------------------------------------------------
 
@@ -37,6 +37,17 @@ class IngestionCfg(BaseModel):
     vision_max_images_per_request: int
     vision_max_edge_px: int
     max_audio_minutes: int
+
+
+class CompactionCfg(BaseModel):
+    """Compaction pass settings (§8).
+
+    Conservative global merge: runs after ingestion, merges only topic
+    centroid pairs whose similarity is >= ``merge_threshold``. Must be
+    HIGHER than ``ingestion.merge_threshold`` to prevent topic collapse.
+    """
+
+    merge_threshold: float = 0.85
 
 
 class TypesCfg(BaseModel):
@@ -100,6 +111,7 @@ class Config(BaseModel):
     eval: EvalCfg
     git: GitCfg
     brain_root: Path
+    compaction: CompactionCfg | None = Field(default_factory=CompactionCfg)
 
 
 # -- helpers -----------------------------------------------------------------

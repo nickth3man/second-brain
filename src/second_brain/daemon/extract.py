@@ -12,13 +12,15 @@ from __future__ import annotations
 import json
 import time
 
-import httpx
 import structlog
 from pydantic import ValidationError
 
 from second_brain.daemon.normalize import estimate_tokens
 from second_brain.models import LibrarianOutput
-from second_brain.openrouter_client import CreditExhaustedError
+from second_brain.openrouter_client import (
+    CreditExhaustedError,
+    OpenRouterAPIError,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -178,15 +180,15 @@ async def extract(
             Defaults to ``""`` when the caller does not supply it.
 
     Attempts the **primary model** first, then falls back to the **repair
-    model** on 5xx / parse errors.
+    model** on 5xx / 4xx (other than 402) / parse errors (§12.2: "4xx →
+    next model"; 5xx → next model; parse/validation → next model).
 
     Raises:
-        CreditExhaustedError: OpenRouter credit exhausted — stops the daemon.
-        ExtractionError: both attempts failed.
+        CreditExhaustedError: OpenRouter credit exhausted — stops the daemon
+            (§12.3).  Propagates immediately, no repair attempt.
+        ExtractionError: both attempts failed (primary + repair).
         ConfidenceFloorError: every returned topic is below
             ``cfg.extraction.confidence_floor`` — pipeline quarantines.
-        httpx.HTTPStatusError: a 4xx status (other than 402) — immediate
-            abort, no fallback.
     """
     extra_body = (
         {"plugins": [{"id": "response-healing"}]}
@@ -270,12 +272,25 @@ async def extract(
     try:
         return await _try(model, 1)
     except CreditExhaustedError:
+        # 402: stops the daemon (§12.3) — never repair.
         raise
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code < 500:  # 4xx (402 already caught above)
-            raise  # immediate abort, no fallback
+    except OpenRouterAPIError as e:
+        # §12.2: 4xx (other than 402) → next model; 5xx → next model.
+        # 402 is already caught above and re-raised.  The OpenRouter client
+        # internally retries 429/500/502/503 with backoff + Retry-After
+        # honour, so by the time we see an OpenRouterAPIError the request
+        # has already exhausted its in-client retries.
+        if e.status < 500:
+            log.info(
+                "extract.primary.4xx_repair_fallback",
+                source_id=source_id,
+                primary_model=model,
+                repair_model=repair_model,
+                status=e.status,
+                error_name=e.error_name,
+            )
         primary_error_type = type(e).__name__
-        # 5xx -> fall through to repair
+        # Fall through to repair.
     except (json.JSONDecodeError, ValidationError) as e:
         primary_error_type = type(e).__name__
         # Parse error -> fallback
@@ -292,7 +307,7 @@ async def extract(
         return await _try(repair_model, 2)
     except CreditExhaustedError:
         raise
-    except (json.JSONDecodeError, ValidationError, httpx.HTTPStatusError) as e:
+    except (json.JSONDecodeError, ValidationError, OpenRouterAPIError) as e:
         raise ExtractionError(
             f"Extraction failed after repair fallback: {e}"
         ) from e

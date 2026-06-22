@@ -18,6 +18,7 @@ from pathlib import Path
 
 import structlog
 
+from second_brain.atomicio import write_atomic
 from second_brain.config import Config
 from second_brain.openrouter_client import (
     CreditExhaustedError,
@@ -135,6 +136,10 @@ def _progress_path(cfg: Config, sha: str) -> Path:
     The checkpoint is a JSON list of completed chunk indices stored at::
 
         <brain_root>/.brain/cache/<sha>.audio_progress.json
+
+    Args:
+        cfg: App configuration (used for ``brain_root``).
+        sha: Full SHA-256 hex digest of the file.
     """
     return cfg.brain_root / ".brain" / "cache" / f"{sha}.audio_progress.json"
 
@@ -150,7 +155,7 @@ async def parse_audio(
     """Transcribe an audio file using chunked STT with resumability.
 
     Workflow:
-        1. SHA-based dedup key (first 16 hex chars).
+        1. SHA-based dedup key (full SHA-256 hex digest).
         2. Probe duration with ffprobe (raises on failure).
         3. Warn (but continue) if duration exceeds ``max_audio_minutes``.
         4. Compute chunk boundaries (``CHUNK_MINUTES`` per chunk).
@@ -171,7 +176,7 @@ async def parse_audio(
         FFprobeError: if the audio file cannot be probed.
         RuntimeError: if all chunks fail, chunk is oversize, or contract error.
     """
-    sha = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
     cache_root = cfg.brain_root / ".brain" / "cache"
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -223,7 +228,7 @@ async def parse_audio(
             logger.warning("audio.chunk_extract_failed", chunk=k, error=str(e))
             chunks.append("")
             done.add(k)
-            prog_path.write_text(json.dumps(sorted(done)))
+            write_atomic(prog_path, json.dumps(sorted(done)))
             continue
 
         # Size check — raise OUTSIDE the main except so oversize propagates.
@@ -237,7 +242,7 @@ async def parse_audio(
             text = await client.transcribe(cfg.models.stt, tmp_chunk)
             chunks.append(text)
             done.add(k)
-            prog_path.write_text(json.dumps(sorted(done)))
+            write_atomic(prog_path, json.dumps(sorted(done)))
             logger.info("audio.chunk_done", chunk=k, chars=len(text))
         except OpenRouterAPIError as e:
             if e.status == 400 and k == 0:
@@ -251,7 +256,7 @@ async def parse_audio(
             )
             chunks.append("")
             done.add(k)
-            prog_path.write_text(json.dumps(sorted(done)))
+            write_atomic(prog_path, json.dumps(sorted(done)))
         except CreditExhaustedError:
             raise
         except Exception as e:
@@ -263,7 +268,7 @@ async def parse_audio(
             )
             chunks.append("")
             done.add(k)
-            prog_path.write_text(json.dumps(sorted(done)))
+            write_atomic(prog_path, json.dumps(sorted(done)))
 
     # Best-effort cleanup of temp chunk directory
     try:

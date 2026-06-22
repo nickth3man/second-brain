@@ -9,7 +9,6 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
 import pytest
 
 from second_brain.config import (
@@ -21,6 +20,7 @@ from second_brain.daemon.extract import (
     extract,
     schema_for_strict,
 )
+from second_brain.openrouter_client import OpenRouterAPIError
 from second_brain.daemon.index import DebouncedIndex
 from second_brain.daemon.linker import LinkContext, SlugLinker
 from second_brain.daemon.normalize import (
@@ -102,7 +102,12 @@ def _make_cfg(tmp_path: Path) -> _FakeCfg:
 
 
 class FakeClient:
-    """Fake OpenRouter client with configurable payloads and failure modes."""
+    """Fake OpenRouter client with configurable payloads and failure modes.
+
+    Failures raise :class:`OpenRouterAPIError` to match the real client
+    contract — the production ``extract()`` now catches that type per §12.2
+    (was previously ``httpx.HTTPStatusError``).
+    """
 
     def __init__(self, payload: dict | None = None, fail_times: int = 0):
         self.payload = payload or {
@@ -132,10 +137,11 @@ class FakeClient:
         self.call_count += 1
         if self.call_count <= self.fail_times:
             # Simulate a 5xx server error
-            raise httpx.HTTPStatusError(
-                "Simulated 5xx",
-                request=None,  # type: ignore[arg-type]
-                response=type("R", (), {"status_code": 500})(),  # type: ignore
+            raise OpenRouterAPIError(
+                status=500,
+                endpoint="/chat/completions",
+                body='{"error":{"name":"ServerError"}}',
+                error_name="ServerError",
             )
         return {
             "choices": [{"message": {"content": json.dumps(self.payload)}}]

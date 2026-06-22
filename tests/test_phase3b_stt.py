@@ -109,7 +109,7 @@ class TestAudioChunking:
         cfg = _FakeCfg(brain_root=tmp_path)
         p = tmp_path / "test.mp3"
         p.write_bytes(b"audio content")
-        sha = hashlib.sha256(b"audio content").hexdigest()[:16]
+        sha = hashlib.sha256(b"audio content").hexdigest()
 
         result = await parse_audio(p, cfg, client)
 
@@ -143,7 +143,7 @@ class TestAudioChunking:
         cfg = _FakeCfg(brain_root=tmp_path)
         p = tmp_path / "test.mp3"
         p.write_bytes(b"resumable audio")
-        sha = hashlib.sha256(b"resumable audio").hexdigest()[:16]
+        sha = hashlib.sha256(b"resumable audio").hexdigest()
 
         # Pre-write progress indicating chunk 0 is done
         prog_path = tmp_path / ".brain" / "cache" / f"{sha}.audio_progress.json"
@@ -180,7 +180,7 @@ class TestAudioChunking:
         cfg = _FakeCfg(brain_root=tmp_path)
         p = tmp_path / "test.mp3"
         p.write_bytes(b"faulty audio")
-        sha = hashlib.sha256(b"faulty audio").hexdigest()[:16]
+        sha = hashlib.sha256(b"faulty audio").hexdigest()
 
         result = await parse_audio(p, cfg, client)
 
@@ -214,7 +214,7 @@ class TestVideoDelegation:
         content = b"fake video content"
         p = tmp_path / "test.mp4"
         p.write_bytes(content)
-        sha = hashlib.sha256(content).hexdigest()[:16]
+        sha = hashlib.sha256(content).hexdigest()
 
         cfg = _FakeCfg(brain_root=tmp_path)
 

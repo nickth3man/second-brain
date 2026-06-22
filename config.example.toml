@@ -85,6 +85,14 @@ vision_max_edge_px = 2048
 max_audio_minutes = 120
 
 # ----------------------------------------------------------------------------
+# Compaction pass (§8) — scheduled global merge of similar topics.
+# ----------------------------------------------------------------------------
+[compaction]
+# Conservative merge threshold. Must be HIGHER than ingestion.merge_threshold
+# to prevent topic collapse. §8 locks this at 0.85.
+merge_threshold = 0.85
+
+# ----------------------------------------------------------------------------
 # File-type routing (lowercase extensions, no leading dot).
 # Edit only if you add new types. Each maps to a stage in the pipeline.
 # ----------------------------------------------------------------------------

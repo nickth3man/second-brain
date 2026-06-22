@@ -226,7 +226,7 @@ def compact() -> None:
         try:
             summary = await run_compaction(
                 cfg, store, vec_store, client,
-                merge_threshold=cfg.ingestion.merge_threshold,
+                merge_threshold=(cfg.compaction.merge_threshold if cfg.compaction else 0.85),
             )
 
             report = run_health_check(cfg, store)

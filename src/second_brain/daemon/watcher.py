@@ -9,13 +9,77 @@ for the pipeline.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from pathlib import Path
 
+import structlog
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from second_brain.daemon.router import is_temp_file
+
+log = structlog.get_logger(__name__)
+
+
+def _can_open_exclusively(path: Path) -> bool:
+    """Return True if *path* can be opened without sharing (§12.3).
+
+    On Windows this uses ``CreateFileW`` with ``dwShareMode=0`` and
+    ``dwDesiredAccess=0`` (``GENERIC_READ`` is used for the access mask so
+    we can read the file once opened), which fails with
+    ``ERROR_SHARING_VIOLATION`` if another process holds the file open for
+    writing.  On success we immediately close the handle and return True.
+
+    On non-Windows platforms we fall back to a best-effort ``open(path, 'rb')``
+    check; POSIX ``open(2)`` does not enforce the same kind of mandatory
+    share-mode lock, so this is only an approximate check and is documented
+    as such.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        CreateFileW = kernel32.CreateFileW
+        CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        CreateFileW.restype = wintypes.HANDLE
+
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+        GENERIC_READ = 0x80000000
+        OPEN_EXISTING = 3
+        FILE_SHARE_NONE = 0
+        FILE_ATTRIBUTE_NORMAL = 0x80
+
+        handle = CreateFileW(
+            str(path),
+            GENERIC_READ,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+
+    # Non-Windows: best-effort read-open.  POSIX does not provide a reliable
+    # exclusive-open check, so this is a weaker guarantee.
+    try:
+        with open(path, "rb"):
+            return True
+    except OSError:
+        return False
 
 
 class InboxWatcher(FileSystemEventHandler):
@@ -73,11 +137,23 @@ class InboxWatcher(FileSystemEventHandler):
         self.loop.run_in_executor(None, self._poll_stable, path)
 
     def _poll_stable(self, path: Path) -> None:
-        """Block until the file is stable (exists, size > 0, unchanged).
+        """Block until the file is stable (§12.3 stable-file gate).
 
-        Polls twice, *settle_seconds* apart, checking that size and mtime
-        are identical between polls.  On stable, pushes the path onto the
-        queue via ``call_soon_threadsafe``.
+        A file is considered stable when **all** of the following hold:
+
+        1. ``stat()`` succeeds (file exists).
+        2. ``st_size > 0`` (non-empty).
+        3. ``st_size`` and ``st_mtime`` are unchanged across two polls
+           separated by ``settle_seconds``.
+        4. The file can be opened exclusively — i.e. no other process
+           currently holds it open for writing.  On Windows this is a real
+           share-mode check via ``CreateFileW(..., dwShareMode=0)``; on other
+           platforms it is a best-effort ``open(path, 'rb')`` check.
+
+        On stable, pushes the path onto the queue via
+        ``call_soon_threadsafe``.  If the exclusivity check fails the file is
+        presumed to still be being written and the poll is aborted (the
+        caller may reschedule).
         """
         time.sleep(self.settle)
         try:
@@ -92,8 +168,14 @@ class InboxWatcher(FileSystemEventHandler):
             s2 = path.stat()
         except OSError:
             return
-        if s2.st_size == s1.st_size and s2.st_mtime == s1.st_mtime:
-            self.loop.call_soon_threadsafe(self.queue.put_nowait, path)
+        if s2.st_size != s1.st_size or s2.st_mtime != s1.st_mtime:
+            return
+
+        if not _can_open_exclusively(path):
+            log.debug("file_still_locked_skip_poll", path=str(path))
+            return
+
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, path)
 
     # -- lifecycle -----------------------------------------------------
 

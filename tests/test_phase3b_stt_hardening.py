@@ -662,7 +662,7 @@ class TestAudioParser:
 
         audio = tmp_path / "test.mp3"
         audio.write_bytes(b"resumable audio")
-        sha = hashlib.sha256(b"resumable audio").hexdigest()[:16]
+        sha = hashlib.sha256(b"resumable audio").hexdigest()
 
         monkeypatch.setattr(
             "second_brain.parse.audio._probe_duration_seconds",
@@ -696,7 +696,7 @@ class TestAudioParser:
 
         audio = tmp_path / "test.mp3"
         audio.write_bytes(b"backward compat")
-        sha = hashlib.sha256(b"backward compat").hexdigest()[:16]
+        sha = hashlib.sha256(b"backward compat").hexdigest()
 
         monkeypatch.setattr(
             "second_brain.parse.audio._probe_duration_seconds",

@@ -14,9 +14,9 @@ import base64
 import json
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import keyring
@@ -47,6 +47,10 @@ class OpenRouterAPIError(OpenRouterError):
         endpoint: The API endpoint path (e.g. ``"/chat/completions"``).
         body: The raw response text (truncated to 2000 chars).
         error_name: Parsed ``error.name`` from the response body, if any.
+        retry_after: Server-provided ``Retry-After`` value in seconds, if
+            present (RFC 9110 §10.2.3). ``None`` when the header is absent
+            or unparseable. Retriers honour this with at least this delay
+            (§12.2).
     """
 
     def __init__(
@@ -55,11 +59,14 @@ class OpenRouterAPIError(OpenRouterError):
         endpoint: str,
         body: str,
         error_name: str | None = None,
+        *,
+        retry_after: int | None = None,
     ) -> None:
         self.status = status
         self.endpoint = endpoint
         self.body = body[:2000]
         self.error_name = error_name
+        self.retry_after = retry_after
         preview = body[:500]
         msg = f"OpenRouter API error {status} on {endpoint}"
         if error_name:
@@ -257,6 +264,18 @@ class OpenRouterClient:
                 error_name = err_data.get("error", {}).get("name")
             except Exception:
                 pass
+            # Parse Retry-After (§12.2) — RFC 9110 §10.2.3 allows either a
+            # delta-seconds integer or an HTTP-date; we only honour the
+            # integer form (the OpenRouter docs specify seconds).
+            retry_after: int | None = None
+            try:
+                headers = getattr(resp, "headers", None)
+                if headers is not None:
+                    raw = headers.get("retry-after")
+                    if raw is not None and raw != "":
+                        retry_after = int(raw)
+            except (TypeError, ValueError, AttributeError):
+                retry_after = None
             log.error(
                 "openrouter.error",
                 endpoint=endpoint,
@@ -270,12 +289,14 @@ class OpenRouterClient:
                     else ""
                 ),
                 error_body_preview=resp.text[:500],
+                retry_after=retry_after,
             )
             raise OpenRouterAPIError(
                 status=resp.status_code,
                 endpoint=endpoint,
                 body=resp.text,
                 error_name=error_name,
+                retry_after=retry_after,
             )
 
         log.info(
@@ -288,6 +309,97 @@ class OpenRouterClient:
             text_preview=(resp.text or "")[:200],
         )
         return resp.json()
+
+    # -- shared retry helper ---------------------------------------------
+
+    async def _with_retry(
+        self,
+        coro_factory: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        model: str,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Run *coro_factory* with retry on transient OpenRouter errors (§12.2).
+
+        Args:
+            coro_factory: Zero-arg callable that returns a fresh awaitable
+                on each invocation.  It must call :meth:`_post` so that
+                status codes / timeouts are raised as
+                :class:`OpenRouterAPIError` / ``httpx`` exceptions.  The
+                factory is invoked once per attempt; the awaitable returned
+                by an earlier invocation MUST NOT be re-awaited.
+            model: Model slug for log context.
+            max_attempts: Total attempts (including the first) before the
+                last exception is reraised.  Defaults to ``3``.
+
+        Retries on:
+
+        - :class:`OpenRouterAPIError` whose ``status`` is in
+          ``{429, 500, 502, 503}``
+        - :class:`httpx.TimeoutException`
+        - :class:`httpx.ConnectError`
+
+        Other 4xx responses (400/401/403/404) are not retried and bubble up
+        to the caller — the §12.2 contract is "4xx → next model" (the
+        caller is responsible for switching to the repair model).
+
+        Honours ``retry_after`` from the most recent failure (waits at
+        least that many seconds before the next attempt) and otherwise
+        uses ``tenacity.wait_exponential_jitter(initial=1, max=10)``.
+
+        Raises:
+            The last exception of a retryable kind, reraised verbatim.
+            Non-retryable exceptions (e.g. :class:`CreditExhaustedError`,
+            400/401/403/404 :class:`OpenRouterAPIError`) propagate
+            immediately on first attempt.
+        """
+        exp_jitter = tenacity.wait_exponential_jitter(initial=1, max=10)
+
+        def _is_retryable(exc: BaseException) -> bool:
+            if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+                return True
+            return (
+                isinstance(exc, OpenRouterAPIError)
+                and exc.status in _RETRYABLE_STATUSES
+            )
+
+        def _wait(retry_state: tenacity.RetryCallState) -> float:
+            # The wait function is called BEFORE the next attempt, with
+            # retry_state.outcome already populated with the previous
+            # attempt's exception.  Honour server-supplied retry_after
+            # when present (§12.2), otherwise fall back to exponential
+            # backoff with jitter.
+            outcome = retry_state.outcome
+            if outcome is not None and outcome.failed:
+                exc = outcome.exception()
+                if (
+                    isinstance(exc, OpenRouterAPIError)
+                    and exc.retry_after is not None
+                    and exc.retry_after > 0
+                ):
+                    return float(exc.retry_after)
+            return exp_jitter(retry_state)
+
+        async for attempt in tenacity.AsyncRetrying(
+            stop=tenacity.stop_after_attempt(max_attempts),
+            wait=_wait,
+            retry=tenacity.retry_if_exception(_is_retryable),
+            reraise=True,
+        ):
+            with attempt:
+                try:
+                    return await coro_factory()
+                except OpenRouterAPIError as e:
+                    if _is_retryable(e):
+                        log.warning(
+                            "openrouter.retry",
+                            model=model,
+                            status=e.status,
+                            attempt=attempt.retry_state.attempt_number,
+                            max_attempts=max_attempts,
+                            retry_after=e.retry_after,
+                        )
+                    raise
 
     # -- API methods -----------------------------------------------------
 
@@ -333,11 +445,14 @@ class OpenRouterClient:
             "messages": [{"role": "user", "content": content}],
             "provider": self._zdr_provider(),
         }
-        resp = await self._post(
-            "/chat/completions",
-            body,
+        resp = await self._with_retry(
+            lambda: self._post(
+                "/chat/completions",
+                body,
+                model=model,
+                req_meta={"n_images": len(images)},
+            ),
             model=model,
-            req_meta={"n_images": len(images)},
         )
         raw = resp["choices"][0]["message"]["content"]
         # Strip <think>...</think> — reasoning models leak CoT into content.
@@ -381,10 +496,21 @@ class OpenRouterClient:
         b64 = base64.b64encode(raw).decode("ascii")  # NO data: URI prefix
         fmt = audio_format or audio_format_for(audio_path)
 
+        # §12.7 — ``whisper-1`` has no ZDR endpoint; the default
+        # ``whisper-large-v3`` model is served by Groq/Together which both
+        # support ZDR.  Force routing through those providers via
+        # ``provider.only`` (in addition to the global ZDR toggle).  Users
+        # who override ``stt`` in config.toml may end up with a model that
+        # *isn't* on either provider — the ``provider.only`` list will be
+        # ignored by OpenRouter when no provider in the list serves the
+        # requested model, falling back to the next cheapest available.
+        stt_provider = self._zdr_provider()
+        stt_provider["only"] = ["groq", "together"]
+
         body: dict[str, Any] = {
             "model": model,
             "input_audio": {"data": b64, "format": fmt},
-            "provider": self._zdr_provider(),
+            "provider": stt_provider,
         }
         if language is not None:
             body["language"] = language
@@ -397,9 +523,25 @@ class OpenRouterClient:
                 and exc.status in _RETRYABLE_STATUSES
             )
 
+        exp_jitter = tenacity.wait_exponential_jitter(initial=1, max=10)
+
+        def _wait(retry_state: tenacity.RetryCallState) -> float:
+            # §12.2 — honour server-supplied ``Retry-After`` (§12.2) when
+            # present, otherwise fall back to exponential backoff + jitter.
+            outcome = retry_state.outcome
+            if outcome is not None and outcome.failed:
+                exc = outcome.exception()
+                if (
+                    isinstance(exc, OpenRouterAPIError)
+                    and exc.retry_after is not None
+                    and exc.retry_after > 0
+                ):
+                    return float(exc.retry_after)
+            return exp_jitter(retry_state)
+
         async for attempt in tenacity.AsyncRetrying(
             stop=tenacity.stop_after_attempt(MAX_STT_RETRIES),
-            wait=tenacity.wait_exponential_jitter(initial=1, max=10),
+            wait=_wait,
             retry=tenacity.retry_if_exception(_is_retryable),
             reraise=True,
         ):
@@ -451,11 +593,16 @@ class OpenRouterClient:
         if extra_body:
             body.update(extra_body)
 
-        return await self._post(
-            "/chat/completions",
-            body,
+        return await self._with_retry(
+            lambda: self._post(
+                "/chat/completions",
+                body,
+                model=model,
+                req_meta={
+                    "input_chars": sum(len(m.get("content", "")) for m in messages)
+                },
+            ),
             model=model,
-            req_meta={"input_chars": sum(len(m.get("content", "")) for m in messages)},
         )
 
     async def chat_completion_clean(
@@ -580,12 +727,17 @@ class OpenRouterClient:
             "input": input,
             "provider": self._zdr_provider(),
         }
-        resp = await self._post(
-            "/embeddings",
-            body,
+        resp = await self._with_retry(
+            lambda: self._post(
+                "/embeddings",
+                body,
+                model=model,
+                req_meta={
+                    "input_chars": len(input)
+                    if isinstance(input, str)
+                    else sum(len(t) for t in input)
+                },
+            ),
             model=model,
-            req_meta={
-                "input_chars": len(input) if isinstance(input, str) else sum(len(t) for t in input)
-            },
         )
         return resp["data"][0]["embedding"]

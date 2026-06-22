@@ -106,7 +106,7 @@ class TestParsePdf:
         assert client.call_count == 2
 
         # Progress file written with both indices
-        sha = hashlib.sha256(pdf.read_bytes()).hexdigest()[:16]
+        sha = hashlib.sha256(pdf.read_bytes()).hexdigest()
         progress = _progress_path(cfg, sha)
         assert progress.exists()
         assert json.loads(progress.read_text()) == [0, 1]
@@ -121,7 +121,7 @@ class TestParsePdf:
         cfg = _FakeCfg(brain_root=tmp_path)
 
         # Write progress marking page 0 as done
-        sha = hashlib.sha256(pdf.read_bytes()).hexdigest()[:16]
+        sha = hashlib.sha256(pdf.read_bytes()).hexdigest()
         progress = _progress_path(cfg, sha)
         progress.parent.mkdir(parents=True, exist_ok=True)
         progress.write_text("[0]")

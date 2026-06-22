@@ -290,6 +290,7 @@ class TestPipelineIntegration:
                 repair_model="",
                 require_parameters=False,
                 enable_healing=False,
+                confidence_floor=0.5,
             ),
             privacy=SimpleNamespace(
                 zdr=True,
